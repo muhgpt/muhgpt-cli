@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muhgpt"
+version = "1.0.0"
+description = "Human-in-the-loop pentest & OSINT CLI assistant"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "muhgpt" }]
+keywords = ["pentest", "osint", "security", "reconnaissance", "cli", "llm", "agent"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+# TODO: replace with your real repository URL before publishing to PyPI.
+[project.urls]
+Homepage = "https://muhgpt.com"
+
+[project.scripts]
+muhgpt = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+packages = ["muhgpt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:urllib3 v2 only supports OpenSSL",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests use terse lambdas as confirmers and import main/conftest at module top
+"tests/*" = ["E731"]

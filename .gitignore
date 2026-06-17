@@ -1,0 +1,14 @@
+# Secrets — never commit a real key
+.env
+
+# Engagement output (audit logs + reports)
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
