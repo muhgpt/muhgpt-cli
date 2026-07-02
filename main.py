@@ -14,7 +14,7 @@ from functools import partial
 from muhgpt import __version__, arsenal, bidi, guard, knowledge, ui
 from muhgpt.agent import AUTONOMOUS_SYSTEM_PROMPT, SYSTEM_PROMPT, Agent
 from muhgpt.api_client import MuhGPTClient, MuhGPTError
-from muhgpt.config import ConfigError, load_settings
+from muhgpt.config import ConfigError, load_settings, save_user_api_key
 from muhgpt.guard import Budget
 from muhgpt.mcp import (
     McpError,
@@ -380,6 +380,41 @@ def _extra_recon_tokens(flag_value, from_settings=()) -> list[str]:
     return tokens
 
 
+def _first_run_key_setup(exc: ConfigError, env_file):
+    """On a missing API key, offer a one-time interactive paste + save, then reload.
+
+    The operator never has to edit a file: they paste the key once, it's saved to
+    the persistent user config (``~/.config/muhgpt/.env``, 0600), and every future
+    run picks it up. Returns loaded Settings on success, or None to fall back to the
+    hard config error (a different config problem, non-interactive, or declined).
+    """
+    if "MUHGPT_API_KEY" not in str(exc):
+        return None  # a different config error — don't hijack it
+    if not sys.stdin.isatty():
+        return None  # no operator to prompt (piped / cron) — keep the hard error
+    print()
+    print(ui.warn("  No API key set yet — quick one-time setup."))
+    print(ui.dim("  Get one at https://muhgpt.com → your account → API keys (mghp_…)."))
+    try:
+        key = input(ui.prompt("  Paste your MUHGPT API key: ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not key:
+        return None
+    if not key.startswith("mghp_"):
+        print(ui.warn("  (heads up: that doesn't look like an 'mghp_…' key — saving anyway)"))
+    path = save_user_api_key(key)
+    os.environ["MUHGPT_API_KEY"] = key
+    print(ui.success(f"  ✓ Saved to {path}")
+          + ui.dim("  — future runs pick it up automatically."))
+    print()
+    try:
+        return load_settings(env_file)
+    except ConfigError:
+        return None
+
+
 def _run_classify(args) -> int:
     """`--classify CMD`: print the guard verdict for CMD and exit (no run, no key).
 
@@ -691,8 +726,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings(args.env_file)
     except ConfigError as exc:
-        print(ui.error(f"[config error] {exc}"), file=sys.stderr)
-        return 2
+        settings = _first_run_key_setup(exc, args.env_file)
+        if settings is None:
+            print(ui.error(f"[config error] {exc}"), file=sys.stderr)
+            return 2
 
     if args.model:
         settings = replace(settings, model=args.model)

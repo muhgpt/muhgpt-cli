@@ -60,7 +60,23 @@ MuhGPT talks to the **MUHGPT API** (`https://api.muhgpt.com/v1`, OpenAI-compatib
 
 1. Sign up at **<https://muhgpt.com>** and open your account.
 2. Create an **API key** — it looks like `mghp_...`.
-3. Put it in your environment (or a `.env` file in the folder you run `muhgpt` from):
+
+**Easiest — just run it.** On first launch with no key configured, MuhGPT asks
+for it and saves it for you:
+
+```text
+$ muhgpt
+  No API key set yet — quick one-time setup.
+  Paste your MUHGPT API key: mghp_…
+  ✓ Saved to ~/.config/muhgpt/.env  — future runs pick it up automatically.
+```
+
+The key is written to `~/.config/muhgpt/.env` (owner-only, `0600`) so every future
+run — from any directory — just works. No file editing, no touching the code.
+
+Prefer to set it yourself? Any of these work (checked in this order — first wins):
+`MUHGPT_API_KEY` in your environment → a `.env` in the current folder →
+`~/.config/muhgpt/.env`.
 
 ```ini
 MUHGPT_API_KEY=mghp_your_key_here
@@ -68,11 +84,9 @@ MUHGPT_BASE_URL=https://api.muhgpt.com/v1
 MUHGPT_MODEL=muh-chat
 ```
 
-The key is read from the environment only; nothing is hardcoded. Start with
-`muhgpt` (or `python main.py` from a clone) — then `/models` lists the models your
-key can use and `/balance` shows your remaining credits. `.env.example` documents
-every optional knob (timeouts, retries, `MUHGPT_TEMPERATURE=none` for reasoning
-models, autonomous/MCP/research settings, …).
+Once running, `/models` lists the models your key can use and `/balance` shows your
+remaining credits. `.env.example` documents every optional knob (timeouts, retries,
+`MUHGPT_TEMPERATURE=none` for reasoning models, autonomous/MCP/research settings, …).
 
 ## Step-by-step quick start
 

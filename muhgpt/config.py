@@ -16,6 +16,44 @@ class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
 
 
+def user_config_path() -> Path:
+    """Path to the persistent user config (``~/.config/muhgpt/.env``).
+
+    Honours ``XDG_CONFIG_HOME``. This is where the first-run setup saves the API
+    key so an installed ``muhgpt`` works from any directory without a local
+    ``.env`` — the operator never edits a file by hand.
+    """
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base).expanduser() / "muhgpt" / ".env"
+
+
+def save_user_api_key(key: str) -> Path:
+    """Persist ``MUHGPT_API_KEY`` to the user config, with 0600 perms. Returns the path.
+
+    Replaces an existing ``MUHGPT_API_KEY`` line and preserves any other lines, so
+    re-running setup updates the key in place rather than duplicating it.
+    """
+    path = user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    kept = []
+    if path.exists():
+        kept = [
+            ln for ln in path.read_text(encoding="utf-8").splitlines()
+            if not ln.strip().startswith("MUHGPT_API_KEY=")
+        ]
+    kept.append(f"MUHGPT_API_KEY={key}")
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)  # a secret — owner read/write only
+    except OSError:
+        pass
+    return path
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable runtime configuration for the MuhGPT agent."""
@@ -166,8 +204,15 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
     Raises:
         ConfigError: If ``MUHGPT_API_KEY`` is not set.
     """
-    if load_dotenv is not None and env_file is not None and Path(env_file).exists():
-        load_dotenv(env_file)
+    if load_dotenv is not None:
+        # A local .env (cwd) wins; the persistent user config fills in anything it
+        # didn't set. load_dotenv never overrides an already-set var, so real env
+        # vars > cwd .env > ~/.config/muhgpt/.env.
+        if env_file is not None and Path(env_file).exists():
+            load_dotenv(env_file)
+        user_cfg = user_config_path()
+        if user_cfg.exists():
+            load_dotenv(user_cfg)
 
     api_key = os.getenv("MUHGPT_API_KEY", "").strip()
     if not api_key:

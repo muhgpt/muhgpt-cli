@@ -80,6 +80,13 @@ class FakeTools:
         return ToolResult(content=f"ran {name}")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_config(monkeypatch, tmp_path):
+    """Point XDG_CONFIG_HOME at an empty per-test dir so no test reads or writes the
+    developer's real ~/.config/muhgpt/.env (keeps missing-key tests hermetic)."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+
+
 @pytest.fixture
 def session(tmp_path) -> Session:
     """A fresh engagement session writing into an isolated temp reports dir."""

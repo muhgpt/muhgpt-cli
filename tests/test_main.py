@@ -241,6 +241,62 @@ def test_no_research_disables_even_when_enabled_in_env(monkeypatch, tmp_path):
     assert captured["research_client"] is None
 
 
+# --- first-run API-key setup ------------------------------------------------
+class _StubBalanceClient:
+    def __init__(self, *_a, **_kw):
+        pass
+
+    def get_usage(self, *_a, **_k):
+        return {}
+
+
+def test_first_run_setup_prompts_saves_and_runs(monkeypatch, tmp_path, capsys):
+    # No key anywhere + interactive stdin -> prompt, save to user config, then run.
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path / "reports"))
+
+    class _TTY:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _p="": "mghp_pastedkey")
+    monkeypatch.setattr(main, "MuhGPTClient", _StubBalanceClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        # --env-file at a nonexistent path so the repo's real .env is never read.
+        rc = main.main(["--env-file", str(tmp_path / "noenv"), "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    from muhgpt.config import user_config_path
+
+    assert "mghp_pastedkey" in user_config_path().read_text()  # persisted
+    assert "Saved to" in capsys.readouterr().out
+
+
+def test_missing_key_non_interactive_still_errors(monkeypatch, tmp_path, capsys):
+    # Piped / cron (no TTY): keep the hard config error — never hang on input.
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    class _NoTTY:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _NoTTY())
+    main.ui.set_enabled(False)
+    try:
+        # --env-file nonexistent so the repo's real .env can't satisfy the key.
+        rc = main.main(["--env-file", str(tmp_path / "noenv"), "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 2
+    assert "MUHGPT_API_KEY is not set" in capsys.readouterr().err
+
+
 # --- models / balance / typed-error hints ----------------------------------
 def test_error_hint_maps_typed_api_errors():
     from muhgpt.api_client import APIStatusError

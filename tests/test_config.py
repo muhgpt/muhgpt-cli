@@ -12,6 +12,42 @@ def test_missing_key_raises(monkeypatch):
         load_settings(env_file=None)
 
 
+# --- persistent user config (first-run key setup) --------------------------
+def test_user_config_path_honours_xdg(monkeypatch, tmp_path):
+    from muhgpt.config import user_config_path
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert user_config_path() == tmp_path / "muhgpt" / ".env"
+
+
+def test_save_user_api_key_writes_replaces_and_locks_perms(monkeypatch, tmp_path):
+    import os
+    import stat
+
+    from muhgpt.config import save_user_api_key, user_config_path
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    path = save_user_api_key("mghp_abc")
+    assert path == user_config_path()
+    assert "MUHGPT_API_KEY=mghp_abc" in path.read_text()
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600  # secret: owner-only
+
+    save_user_api_key("mghp_xyz")  # replace in place, no duplicate line
+    text = path.read_text()
+    assert "mghp_xyz" in text and "mghp_abc" not in text
+    assert text.count("MUHGPT_API_KEY=") == 1
+
+
+def test_load_settings_reads_saved_user_config(monkeypatch, tmp_path):
+    from muhgpt.config import save_user_api_key
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    save_user_api_key("mghp_fromconfig")
+    # no cwd .env, no env var -> the key must come from ~/.config/muhgpt/.env
+    assert load_settings(env_file=None).api_key == "mghp_fromconfig"
+
+
 def test_reads_env_overrides(monkeypatch):
     monkeypatch.setenv("MUHGPT_API_KEY", "abc")
     monkeypatch.setenv("MUHGPT_MODEL", "custom-model")

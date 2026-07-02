@@ -24,3 +24,7 @@ venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
+
+# Build artifacts (PyPI dist)
+dist/
+build/
