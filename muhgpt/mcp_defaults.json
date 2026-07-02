@@ -1,0 +1,21 @@
+{
+  "_comment": "Curated free, no-API-key MCP servers bundled with MuhGPT (pentest recon / OSINT / deep search). Loaded automatically when MCP is enabled (--mcp / MUHGPT_MCP_ENABLED), unless --no-mcp-defaults / MUHGPT_MCP_DEFAULTS=0. The operator's --mcp-config is merged on top and overrides same-named servers. All require Node/npx; versions are pinned. All tools are read-only and route through the guard (CONFIRM by default).",
+  "mcpServers": {
+    "ddg": {
+      "command": "npx",
+      "args": ["-y", "@oevortex/ddg_search@1.3.0"]
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "@tokenizin/mcp-npx-fetch@1.0.0"]
+    },
+    "wikipedia": {
+      "command": "npx",
+      "args": ["-y", "wikipedia-mcp@1.0.3"]
+    },
+    "think": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking@2025.12.18"]
+    }
+  }
+}

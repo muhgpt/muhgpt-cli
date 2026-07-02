@@ -60,6 +60,32 @@ def test_streamview_keeps_raw_stream_off_tty(monkeypatch):
     assert "|---|" in out          # the raw markdown is left as printed
 
 
+def test_streamview_reorders_rtl_even_with_colors_off(monkeypatch):
+    # --no-color (ui disabled) must still re-render to reorder Arabic, which the
+    # terminal would otherwise show with letters mirrored and disconnected.
+    main.ui.set_enabled(False)
+    cap = FakeTTY()
+    monkeypatch.setattr(sys, "stdout", cap)
+    view = main._StreamView(bidi_mode="auto")
+    view.delta("مرحبا")
+    view.boundary(final=True)
+    main.ui.set_enabled(None)
+    out = cap.getvalue()
+    assert "\033[J" in out                               # the streamed block was cleared
+    assert main.bidi.to_display("مرحبا", "auto") in out  # and replaced with the reshaped form
+
+
+def test_streamview_leaves_rtl_raw_when_bidi_off(monkeypatch):
+    main.ui.set_enabled(False)
+    cap = FakeTTY()
+    monkeypatch.setattr(sys, "stdout", cap)
+    view = main._StreamView(bidi_mode="off")
+    view.delta("مرحبا")
+    view.boundary(final=True)  # colors off + bidi off -> no re-render
+    main.ui.set_enabled(None)
+    assert cap.getvalue() == "\nمرحبا\n"
+
+
 # --- _authorize_autonomous -------------------------------------------------
 def _settings():
     return Settings(api_key="k")
@@ -156,3 +182,259 @@ def test_auto_max_idle_is_wired_into_the_budget(monkeypatch, tmp_path):
     assert rc == 0
     assert captured["budget"] is not None
     assert captured["budget"].max_idle_rounds == 7
+
+
+# --- _build_mcp (no-network paths) -----------------------------------------
+def test_research_model_flag_wires_research_client(monkeypatch, tmp_path):
+    # --research-model must build a research client and hand it to the registry.
+    monkeypatch.setenv("MUHGPT_API_KEY", "k")
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path))
+    captured = {}
+
+    class StubReg:
+        def __init__(self, *_a, **kw):
+            captured["research_client"] = kw.get("research_client")
+
+    class StubAgent:
+        def __init__(self, *_a, **_kw):
+            self.last_turn_usage = None
+
+        def run_turn(self, _msg):
+            return "ok"
+
+    monkeypatch.setattr(main, "ToolRegistry", StubReg)
+    monkeypatch.setattr(main, "Agent", StubAgent)
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--research-model", "relace-search", "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    assert captured["research_client"] is not None
+
+
+def test_no_research_disables_even_when_enabled_in_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("MUHGPT_API_KEY", "k")
+    monkeypatch.setenv("MUHGPT_RESEARCH_ENABLED", "1")
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path))
+    captured = {}
+
+    class StubReg:
+        def __init__(self, *_a, **kw):
+            captured["research_client"] = kw.get("research_client")
+
+    class StubAgent:
+        def __init__(self, *_a, **_kw):
+            self.last_turn_usage = None
+
+        def run_turn(self, _msg):
+            return "ok"
+
+    monkeypatch.setattr(main, "ToolRegistry", StubReg)
+    monkeypatch.setattr(main, "Agent", StubAgent)
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--no-research", "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    assert captured["research_client"] is None
+
+
+# --- models / balance / typed-error hints ----------------------------------
+def test_error_hint_maps_typed_api_errors():
+    from muhgpt.api_client import APIStatusError
+
+    assert "out of credits" in main._error_hint(
+        APIStatusError(402, "x", error_type="insufficient_quota"))
+    assert "/models" in main._error_hint(APIStatusError(404, "x", error_type="model_not_found"))
+    assert "/models" in main._error_hint(APIStatusError(403, "x"))       # by status code
+    assert "API key" in main._error_hint(APIStatusError(401, "x"))
+    assert main._error_hint(APIStatusError(500, "x")) == ""              # unknown -> no hint
+
+
+def test_render_models_marks_current():
+    out = main._render_models(
+        [{"id": "muh-chat", "owned_by": "muhgpt"}, {"id": "gpt-4o", "owned_by": "muhgpt"}],
+        "muh-chat",
+    )
+    assert "muh-chat" in out and "gpt-4o" in out and "current" in out
+
+
+def test_render_usage_shows_balance_and_totals():
+    out = main._render_usage({
+        "balance": 12500, "totals": {"credits": 5000, "tokens": 1000, "requests": 4},
+        "start": "2026-06-01", "end": "2026-06-30",
+        "by_model": [{"model": "muh-chat", "credits": 4500, "requests": 40}],
+    })
+    assert "12,500" in out and "5,000" in out and "requests" in out and "muh-chat" in out
+
+
+def _stub_agent():
+    class StubAgent:
+        def __init__(self, *_a, **_kw):
+            self.last_turn_usage = None
+
+        def run_turn(self, _msg):
+            return "ok"
+
+    return StubAgent
+
+
+def test_startup_balance_line_shown(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("MUHGPT_API_KEY", "k")
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path))
+
+    class StubClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get_usage(self, start=None, end=None):
+            return {"balance": 4242}
+
+    monkeypatch.setattr(main, "MuhGPTClient", StubClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    assert "4,242 remaining" in capsys.readouterr().out
+
+
+def test_no_balance_flag_suppresses_startup_line(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("MUHGPT_API_KEY", "k")
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path))
+
+    class StubClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get_usage(self, *_a, **_k):
+            raise AssertionError("get_usage must not be called with --no-balance")
+
+    monkeypatch.setattr(main, "MuhGPTClient", StubClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--no-balance", "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    assert "remaining" not in capsys.readouterr().out
+
+
+def test_startup_balance_is_best_effort_on_error(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("MUHGPT_API_KEY", "k")
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path))
+
+    class StubClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get_usage(self, *_a, **_k):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(main, "MuhGPTClient", StubClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0  # a balance error never aborts the session
+    out = capsys.readouterr().out
+    assert "remaining" not in out and "Done." in out
+
+
+# --- guard inspector + extra-recon wiring ----------------------------------
+def test_classify_inspector_blocks_without_api_key(monkeypatch, capsys):
+    # --classify must work with NO MUHGPT_API_KEY (like --version): early return.
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.delenv("MUHGPT_EXTRA_SAFE_RECON", raising=False)
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--no-color", "--classify", "rm -rf /"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "BLOCK" in out and "rm -rf /" in out
+
+
+def test_classify_inspector_allows_mixed_case_tool(monkeypatch, capsys):
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.delenv("MUHGPT_EXTRA_SAFE_RECON", raising=False)
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--no-color", "--classify", "theHarvester -d example.com"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    assert "ALLOW" in capsys.readouterr().out
+
+
+def test_classify_inspector_reports_extra_recon(monkeypatch, capsys):
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.delenv("MUHGPT_EXTRA_SAFE_RECON", raising=False)
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--no-color", "--extra-recon", "gobuster,bash",
+                        "--classify", "gobuster dir -u http://x"])
+    finally:
+        main.ui.set_enabled(None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ALLOW" in out
+    assert "gobuster" in out  # accepted
+    assert "bash" in out      # rejected (never-allowlist)
+
+
+def test_extra_recon_flag_wires_a_working_classifier(monkeypatch, tmp_path):
+    # The classifier built from --extra-recon is what ToolRegistry receives, and it
+    # honors the added tool while keeping the denylist intact.
+    monkeypatch.setenv("MUHGPT_API_KEY", "k")
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path))
+    monkeypatch.delenv("MUHGPT_EXTRA_SAFE_RECON", raising=False)
+    captured = {}
+
+    class StubReg:
+        def __init__(self, *_a, **kw):
+            captured["classifier"] = kw.get("classifier")
+
+    class StubAgent:
+        def __init__(self, *_a, **_kw):
+            self.last_turn_usage = None
+
+        def run_turn(self, _msg):
+            return "ok"
+
+    monkeypatch.setattr(main, "ToolRegistry", StubReg)
+    monkeypatch.setattr(main, "Agent", StubAgent)
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--extra-recon", "gobuster", "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    from muhgpt.guard import Verdict
+
+    clf = captured["classifier"]
+    assert clf is not None
+    assert clf("gobuster dir -u http://x")[0] is Verdict.ALLOW  # extra-recon honored
+    assert clf("rm -rf /")[0] is Verdict.BLOCK                  # denylist intact
+    assert clf("bash -c id")[0] is Verdict.CONFIRM              # bash was rejected
+
+
+def test_build_mcp_disabled_returns_none():
+    main.ui.set_enabled(False)
+    settings = Settings(api_key="x")
+    assert main._build_mcp(settings, enabled=False, config_path=None, use_defaults=True) is None
+
+
+def test_build_mcp_no_servers_returns_none():
+    main.ui.set_enabled(False)
+    settings = Settings(api_key="x")
+    # enabled, but defaults disabled and no user config -> nothing to connect to
+    assert main._build_mcp(settings, enabled=True, config_path=None, use_defaults=False) is None

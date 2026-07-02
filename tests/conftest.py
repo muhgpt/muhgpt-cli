@@ -57,6 +57,15 @@ class FakeSession:
             raise item
         return item
 
+    def request(
+        self, method: str, url: str, params: Any = None, timeout: Any = None, **kwargs: Any
+    ) -> FakeResponse:
+        self.calls.append({"method": method, "url": url, "params": params, "timeout": timeout})
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
 
 class FakeTools:
     """Minimal ToolRegistry stand-in that records dispatches."""

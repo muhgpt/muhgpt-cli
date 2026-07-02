@@ -94,3 +94,59 @@ def test_tools_only_sent_when_provided():
     assert "tools" not in http.calls[0]["json"]
     client.chat_completion([{"role": "user", "content": "x"}], tools=[{"type": "function"}])
     assert http.calls[1]["json"]["tools"] == [{"type": "function"}]
+
+
+# --- models + usage (GET endpoints) ----------------------------------------
+def test_list_models_returns_data_array():
+    client, http = _client([FakeResponse(200, {"object": "list", "data": [
+        {"id": "muh-chat", "owned_by": "muhgpt"}, {"id": "gpt-4o", "owned_by": "muhgpt"}]})])
+    models = client.list_models()
+    assert [m["id"] for m in models] == ["muh-chat", "gpt-4o"]
+    assert http.calls[0]["method"] == "GET"
+    assert http.calls[0]["url"].endswith("/models")
+
+
+def test_get_usage_sends_date_range_and_parses_balance():
+    client, http = _client([FakeResponse(200, {
+        "object": "usage", "balance": 12500, "totals": {"credits": 5000}})])
+    usage = client.get_usage(start="2026-06-01", end="2026-06-30")
+    assert usage["balance"] == 12500
+    assert http.calls[0]["url"].endswith("/usage")
+    assert http.calls[0]["params"] == {"start": "2026-06-01", "end": "2026-06-30"}
+
+
+def test_get_usage_omits_empty_params():
+    client, http = _client([FakeResponse(200, {"balance": 1})])
+    client.get_usage()
+    assert http.calls[0]["params"] is None
+
+
+def test_get_endpoints_retry_on_500(no_sleep):
+    client, http = _client([FakeResponse(500, text="boom"),
+                            FakeResponse(200, {"object": "list", "data": []})])
+    assert client.list_models() == []
+    assert len(http.calls) == 2
+
+
+def test_typed_error_carries_error_type():
+    for code, etype in [(402, "insufficient_quota"), (403, "model_not_allowed"),
+                        (404, "model_not_found")]:
+        client, _ = _client([FakeResponse(code, {"error": {"message": "m", "type": etype}})])
+        with pytest.raises(APIStatusError) as exc:
+            client.list_models()
+        assert exc.value.status_code == code
+        assert exc.value.error_type == etype
+
+
+def test_chat_completion_errors_are_typed_too():
+    client, _ = _client([FakeResponse(402, {"error": {
+        "message": "no credits", "type": "insufficient_quota"}})])
+    with pytest.raises(APIStatusError) as exc:
+        client.chat_completion([{"role": "user", "content": "x"}])
+    assert exc.value.error_type == "insufficient_quota"
+
+
+def test_models_bad_shape_raises_response_error():
+    client, _ = _client([FakeResponse(200, {"nope": True})])
+    with pytest.raises(APIResponseError):
+        client.list_models()

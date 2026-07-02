@@ -1,8 +1,17 @@
 # Secrets — never commit a real key
 .env
 
+# Backend server source dropped in for reference — contains real secrets
+# (DB creds, OAuth/API keys). Read-only; never commit or package it.
+api.muhgpt.com/
+
+# Third-party recon tool clones / local MCP config
+gau/
+mcp.json
+
 # Engagement output (audit logs + reports)
 reports/
+.ruff_cache/
 
 # Python
 __pycache__/

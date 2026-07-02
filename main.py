@@ -4,17 +4,25 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import re
 import shutil
 import sys
 from dataclasses import replace
 from functools import partial
 
-from muhgpt import __version__, ui
+from muhgpt import __version__, arsenal, bidi, guard, knowledge, ui
 from muhgpt.agent import AUTONOMOUS_SYSTEM_PROMPT, SYSTEM_PROMPT, Agent
 from muhgpt.api_client import MuhGPTClient, MuhGPTError
 from muhgpt.config import ConfigError, load_settings
 from muhgpt.guard import Budget
+from muhgpt.mcp import (
+    McpError,
+    McpManager,
+    default_config_path,
+    load_mcp_config,
+    merge_mcp_configs,
+)
 from muhgpt.render import render_markdown, wrapped_rows
 from muhgpt.session import Session
 from muhgpt.tools import ToolRegistry, console_confirm
@@ -22,6 +30,11 @@ from muhgpt.tools import ToolRegistry, console_confirm
 _COMMANDS = [
     ("/help", "Show this help."),
     ("/install <pkg>...", "Install one or more CLI tools via the package manager."),
+    ("/mcp", "List connected MCP servers and their tools."),
+    ("/models", "List the models available on your API key."),
+    ("/balance", "Show your real remaining credits + usage (or /balance <start> <end>)."),
+    ("/research <q>", "Run the OSINT research sub-agent on a question (if enabled)."),
+    ("/skills", "List vulnerability playbooks the agent can load (or /skills <name> to preview)."),
     ("/report", "Export the engagement report to Markdown now."),
     ("/scope", "Show the engagement scope."),
     ("/exit, /quit", "Exit (you will be offered a report export)."),
@@ -103,6 +116,11 @@ _SKILLS: dict[str, tuple[str, str]] = {
         "X-Frame-Options, …) and exposed paths like robots.txt. Save the findings to the report.",
     ),
 }
+
+# Attack-chain playbooks (the HexStrike-style multi-tool objectives) are sourced
+# from the arsenal so the chaining catalog stays in one place; they resolve
+# through the same /<name> <target> path as the built-in recon skills.
+_SKILLS.update(arsenal.PLAYBOOKS)
 
 # A recon target: a single host / domain / URL / IP token, no spaces or shell chars.
 _SKILL_TARGET = re.compile(r"^[A-Za-z0-9][\w.\-:/@?=&%+]{0,253}$")
@@ -273,6 +291,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Disable token streaming (buffer the full reply, then render it).",
     )
     parser.add_argument(
+        "--no-balance",
+        action="store_true",
+        help="Don't fetch/show your real credit balance at session start.",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Autonomous mode: plan and run read-only recon end-to-end without "
@@ -284,7 +307,104 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run a single objective (or a '/skill target') non-interactively, then "
         "exit. Pairs with --auto for scripting/cron; the report is exported automatically.",
     )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="High-trust autonomous mode: auto-approve EVERYTHING except the destructive "
+        "denylist and secret-file reads (curl/wget/pipes/installs/file-reads run unattended). "
+        "Implies --auto. Use only against trusted/authorized targets.",
+    )
+    parser.add_argument(
+        "--mcp",
+        action="store_true",
+        help="Enable the MCP client (connect to external MCP servers and use their tools).",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        metavar="PATH",
+        help="Path to an mcpServers JSON config (overrides MUHGPT_MCP_CONFIG).",
+    )
+    parser.add_argument(
+        "--scan-mode",
+        choices=["quick", "standard", "deep"],
+        help="Depth of autonomous testing: quick (fast/breadth), standard (balanced), "
+        "deep (exhaustive + vuln chaining). Default: standard (or MUHGPT_SCAN_MODE).",
+    )
+    parser.add_argument(
+        "--no-mcp", action="store_true", help="Disable the MCP client even if enabled in .env."
+    )
+    parser.add_argument(
+        "--no-mcp-defaults",
+        action="store_true",
+        help="Don't load the bundled curated free MCP servers; use only --mcp-config.",
+    )
+    parser.add_argument(
+        "--research",
+        action="store_true",
+        help="Enable the OSINT research sub-agent (a `research` tool + the /research command) "
+        "on the main model.",
+    )
+    parser.add_argument(
+        "--research-model",
+        metavar="MODEL",
+        help="Use a dedicated model for the research sub-agent (implies --research), e.g. a "
+        "Relace Search / Perplexity endpoint. Pair with MUHGPT_RESEARCH_BASE_URL / "
+        "MUHGPT_RESEARCH_API_KEY for a separate provider.",
+    )
+    parser.add_argument(
+        "--no-research",
+        action="store_true",
+        help="Disable the research sub-agent even if enabled in .env.",
+    )
+    parser.add_argument(
+        "--extra-recon",
+        metavar="LIST",
+        help="Comma/space list of extra read-only recon tools to add to the auto-run "
+        "allowlist in --auto (merged with MUHGPT_EXTRA_SAFE_RECON). Dangerous binaries "
+        "(shells, interpreters, curl/wget, …) are rejected.",
+    )
+    parser.add_argument(
+        "--classify",
+        metavar="CMD",
+        help="Dry-run: print how CMD would be classified by the guard "
+        "(BLOCK/ALLOW/CONFIRM + reason) and exit. Runs nothing; needs no API key.",
+    )
     return parser.parse_args(argv)
+
+
+def _extra_recon_tokens(flag_value, from_settings=()) -> list[str]:
+    """Merge the --extra-recon flag with the .env/settings list into raw tokens."""
+    tokens = list(from_settings)
+    if flag_value:
+        tokens += [t for t in re.split(r"[\s,]+", flag_value) if t]
+    return tokens
+
+
+def _run_classify(args) -> int:
+    """`--classify CMD`: print the guard verdict for CMD and exit (no run, no key).
+
+    Reads the extra-recon allowlist from MUHGPT_EXTRA_SAFE_RECON + --extra-recon so
+    the operator can preview exactly how their configured allowlist classifies a
+    command, without starting a session or needing credentials.
+    """
+    env_extra = tuple(
+        t for t in re.split(r"[\s,]+", os.getenv("MUHGPT_EXTRA_SAFE_RECON", "")) if t
+    )
+    accepted, rejected = guard.sanitize_extra_recon(
+        _extra_recon_tokens(args.extra_recon, env_extra)
+    )
+    verdict, reason = guard.classify(args.classify, accepted)
+    tint = {"BLOCK": ui.error, "ALLOW": ui.success, "CONFIRM": ui.warn}[verdict.name]
+    # Don't surface the raw denylist regex (it's audit-log-only by policy); show a
+    # generic reason for BLOCK. ALLOW/CONFIRM reasons are already safe to display.
+    shown = "destructive/weaponized (denylisted)" if verdict is guard.Verdict.BLOCK else reason
+    print(tint(verdict.name) + ui.dim(f"  ({shown})"))
+    print(ui.dim(f"  $ {args.classify}"))
+    if accepted:
+        print(ui.dim("  extra recon allowlisted: ") + ", ".join(sorted(accepted)))
+    if rejected:
+        print(ui.warn("  rejected (never-allowlist): ") + ", ".join(rejected))
+    return 0
 
 
 class _StreamView:
@@ -297,9 +417,10 @@ class _StreamView:
     not a TTY, the raw stream is left untouched.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, bidi_mode: str = "off") -> None:
         self._open = False
         self._buf: list[str] = []
+        self._bidi = bidi_mode
 
     def delta(self, piece: str) -> None:
         if not self._open:
@@ -314,13 +435,18 @@ class _StreamView:
             self._buf = []
             return
         text = "".join(self._buf)
-        if final and sys.stdout.isatty() and ui.enabled():
+        # Re-render to apply Markdown styling (needs colors) or to reorder RTL
+        # text the terminal would otherwise mangle (needed even with --no-color).
+        if final and sys.stdout.isatty() and (ui.enabled() or self._wants_bidi(text)):
             self._rerender(text)
         else:
             sys.stdout.write("\n")
         sys.stdout.flush()
         self._open = False
         self._buf = []
+
+    def _wants_bidi(self, text: str) -> bool:
+        return self._bidi == "on" or (self._bidi == "auto" and bidi.contains_rtl(text))
 
     def _rerender(self, text: str) -> None:
         size = shutil.get_terminal_size((80, 24))
@@ -330,7 +456,7 @@ class _StreamView:
             if rows > 1:
                 sys.stdout.write(f"\033[{rows - 1}A")
             sys.stdout.write("\033[J")
-            sys.stdout.write(render_markdown(text) + "\n")
+            sys.stdout.write(bidi.to_display(render_markdown(text), self._bidi) + "\n")
         else:  # too tall to rewind safely — keep the raw stream as printed
             sys.stdout.write("\n")
 
@@ -360,6 +486,74 @@ def _print_usage(turn: dict[str, int] | None, session: Session, settings) -> Non
     print(ui.dim(line))
 
 
+def _error_hint(exc) -> str:
+    """An actionable dim suffix for known typed API errors, else ''.
+
+    Maps the muh API's error types / HTTP codes to a next step so a failure is
+    self-explanatory (out of credits, wrong model, bad key).
+    """
+    et = getattr(exc, "error_type", None)
+    code = getattr(exc, "status_code", None)
+    if et == "insufficient_quota" or code == 402:
+        return "  → out of credits. Check with /balance; top up at https://muhgpt.com"
+    if et == "model_not_allowed" or code == 403:
+        return "  → this API key can't use that model. See /models for what's allowed."
+    if et == "model_not_found" or code == 404:
+        return "  → unknown model. See /models for available IDs."
+    if code == 401:
+        return "  → invalid or missing API key. Check MUHGPT_API_KEY in your .env."
+    return ""
+
+
+def _render_models(models: list, current: str) -> str:
+    """Aligned list of available model IDs, marking the configured one."""
+    lines = [ui.accent("Available models:")]
+    for m in models:
+        mid = str(m.get("id", "?"))
+        owner = str(m.get("owned_by", ""))
+        mark = ui.success("  ← current") if mid == current else ""
+        lines.append("  " + ui.info(mid.ljust(34)) + ui.dim(owner) + mark)
+    return "\n".join(lines)
+
+
+def _render_usage(usage: dict) -> str:
+    """Render balance + usage totals (and a short by-model breakdown)."""
+    balance = usage.get("balance")
+    totals = usage.get("totals") or {}
+    lines = [ui.accent("Credits & usage:")]
+    if balance is not None:
+        lines.append("  " + ui.success(f"balance: {balance:,} credits"))
+    if totals:
+        lines.append("  " + ui.dim(
+            f"used: {totals.get('credits', 0):,} credits · {totals.get('tokens', 0):,} tokens · "
+            f"{totals.get('requests', 0):,} requests"
+        ))
+    period = f"{usage.get('start', '')} → {usage.get('end', '')}".strip(" →")
+    if period:
+        lines.append("  " + ui.dim(f"period: {period}"))
+    for bm in (usage.get("by_model") or [])[:5]:
+        lines.append("  " + ui.dim(
+            f"  {bm.get('model', '?')}: {bm.get('credits', 0):,} credits, "
+            f"{bm.get('requests', 0)} req"
+        ))
+    return "\n".join(lines)
+
+
+def _print_startup_balance(client) -> None:
+    """Best-effort: show real remaining credits at startup; silent on any error.
+
+    Never breaks the session — a network failure, a 404 on a non-muh endpoint, or
+    a missing balance field just skips the line.
+    """
+    try:
+        usage = client.get_usage()
+    except Exception:  # noqa: BLE001 - a startup nicety must never abort the session
+        return
+    balance = usage.get("balance") if isinstance(usage, dict) else None
+    if balance is not None:
+        print(ui.dim(f"  credits: {balance:,} remaining"))
+
+
 def _default_operator() -> str:
     """Best-effort OS login name, used as the operator handle."""
     try:
@@ -369,35 +563,47 @@ def _default_operator() -> str:
 
 
 def _authorize_autonomous(
-    requested: bool, scope: str, settings, session: Session, interactive: bool = True
+    requested: bool, scope: str, settings, session: Session, interactive: bool = True,
+    yolo: bool = False,
 ) -> bool:
     """Confirm autonomous execution before the session; return the final flag.
 
     Interactive sessions get a one-time ``[y/N]`` acknowledgement (a "no" falls
     back to manual HITL mode). For non-interactive one-shot runs the `--auto`
     flag itself is the consent, since there is no operator to answer a prompt.
+    ``yolo`` prints a stronger warning (it auto-approves the CONFIRM tier too).
     """
     if not requested:
         return False
     print()
-    print(ui.warn("  ⚠ AUTONOMOUS MODE"))
-    print(ui.dim("  The agent self-directs: it runs read-only recon and installs tools without"))
-    print(ui.dim("  approving each step. Destructive/irreversible commands are blocked; unknown"))
-    print(ui.dim(
-        "  commands and installs still prompt. Only run against authorized, in-scope targets."
-    ))
+    if yolo:
+        print(ui.error("  ⚠ YOLO AUTONOMOUS MODE"))
+        print(ui.dim("  The agent auto-approves EVERYTHING except the destructive denylist and"))
+        print(ui.dim("  secret-file reads — including curl/wget, pipes, installs, and file reads."))
+        print(ui.dim("  No per-step prompts. Only run against targets you fully trust: scanned"))
+        print(ui.dim("  output could prompt-inject the model into running CONFIRM-tier commands."))
+    else:
+        print(ui.warn("  ⚠ AUTONOMOUS MODE"))
+        print(ui.dim("  The agent self-directs: it runs read-only recon and installs tools"))
+        print(ui.dim("  without approving each step. Destructive commands are blocked; unknown"))
+        print(ui.dim(
+            "  commands and installs still prompt. Only run against authorized, in-scope targets."
+        ))
     print(ui.dim(
         f"  Scope: {scope}    Budget: {settings.auto_max_rounds} rounds / "
         f"{settings.auto_max_commands} cmds / {settings.auto_wall_clock_s}s"
     ))
     if not interactive:
         print(ui.dim("  Non-interactive run — authorized via --auto."))
-        session.log_event("autonomous_authorized", {"scope": scope, "noninteractive": True})
+        session.log_event(
+            "autonomous_authorized", {"scope": scope, "noninteractive": True, "yolo": yolo}
+        )
         return True
-    if not console_confirm(ui.warn(f"  Run autonomously against '{scope}'?")):
+    prompt = "  Run in YOLO mode against '{}'?" if yolo else "  Run autonomously against '{}'?"
+    if not console_confirm(ui.warn(prompt.format(scope))):
         print(ui.dim("  Autonomous mode declined — continuing in manual (HITL) mode."))
         return False
-    session.log_event("autonomous_authorized", {"scope": scope})
+    session.log_event("autonomous_authorized", {"scope": scope, "yolo": yolo})
     return True
 
 
@@ -407,7 +613,7 @@ def _drive(produce_reply, *, agent: Agent, settings, session: Session, stream_vi
         reply = produce_reply()
     except MuhGPTError as exc:
         stream_view.boundary(False)
-        print(ui.error(f"[api error] {exc}"))
+        print(ui.error(f"[api error] {exc}") + ui.dim(_error_hint(exc)))
         return
     except KeyboardInterrupt:
         stream_view.boundary(False)
@@ -416,8 +622,59 @@ def _drive(produce_reply, *, agent: Agent, settings, session: Session, stream_vi
     # In stream mode the reply was already printed live (and re-rendered) by the
     # stream view; only the buffered path renders it here.
     if not settings.stream:
-        print("\n" + render_markdown(reply) + "\n")
+        rendered = render_markdown(reply)
+        if sys.stdout.isatty():  # reorder RTL for display; keep pipes logical
+            rendered = bidi.to_display(rendered, settings.bidi)
+        print("\n" + rendered + "\n")
     _print_usage(agent.last_turn_usage, session, settings)
+
+
+def _build_mcp(settings, enabled: bool, config_path, use_defaults: bool) -> McpManager | None:
+    """Connect to the MCP servers (bundled curated defaults + the operator's own).
+
+    When enabled, loads the bundled free servers (search/OSINT/fetch) unless
+    ``use_defaults`` is off, then merges the operator's ``config_path`` on top
+    (same-named entries override the bundled one). Failures are non-fatal: a
+    missing config or a server that won't connect prints a warning and is skipped,
+    so the CLI always comes up. Returns a connected manager only when at least one
+    tool was discovered (otherwise its subprocesses are closed and None returned).
+    """
+    if not enabled:
+        return None
+
+    config_lists = []
+    if use_defaults:
+        try:
+            config_lists.append(load_mcp_config(default_config_path()))
+        except McpError as exc:
+            print(ui.warn(f"  [mcp] could not load bundled defaults: {exc}"))
+    if config_path is not None:
+        try:
+            config_lists.append(load_mcp_config(config_path))
+        except McpError as exc:
+            print(ui.error(f"  [mcp] {exc}"))
+            return None
+    configs = merge_mcp_configs(*config_lists)
+    if not configs:
+        print(ui.warn(
+            "  [mcp] enabled but no servers (defaults off and no --mcp-config) — skipping."
+        ))
+        return None
+
+    print(ui.dim(f"  [mcp] connecting to {len(configs)} server(s)…"))
+    manager = McpManager(
+        configs, timeout=settings.mcp_timeout, auto_tools=settings.mcp_auto_tools
+    )
+    manager.connect()
+    for name, err in manager.errors:
+        print(ui.warn(f"  [mcp] {name}: {err}"))
+    tool_count = len(manager.tools)
+    if not tool_count:
+        manager.close()
+        print(ui.warn("  [mcp] no tools available — MCP disabled for this session."))
+        return None
+    print(ui.success(f"  [mcp] {tool_count} tool(s) ready") + ui.dim(f"  ({manager.describe()})"))
+    return manager
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -425,6 +682,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.no_color:
         ui.set_enabled(False)
+    # Dry-run guard inspector: classify a command and exit, before anything else
+    # (no banner, no session, no API key required).
+    if args.classify is not None:
+        return _run_classify(args)
     print(ui.banner(__version__))
 
     try:
@@ -437,6 +698,16 @@ def main(argv: list[str] | None = None) -> int:
         settings = replace(settings, model=args.model)
     if args.no_stream:
         settings = replace(settings, stream=False)
+    if args.scan_mode:
+        settings = replace(settings, scan_mode=args.scan_mode)
+    if args.research_model:
+        settings = replace(
+            settings, research_model=args.research_model, research_enabled=True
+        )
+    elif args.research:
+        settings = replace(settings, research_enabled=True)
+    if args.no_research:
+        settings = replace(settings, research_enabled=False, research_model="")
 
     operator = (args.operator or _default_operator()).strip() or "operator"
     scope = args.scope.strip() or "unrestricted"
@@ -444,10 +715,12 @@ def main(argv: list[str] | None = None) -> int:
     session = Session(operator=operator, scope=scope, reports_dir=settings.reports_dir)
     client = MuhGPTClient(settings)
 
+    yolo = args.yolo or settings.yolo
     auto = _authorize_autonomous(
-        args.auto or settings.auto, scope, settings, session,
-        interactive=args.objective is None,
+        args.auto or settings.auto or yolo, scope, settings, session,
+        interactive=args.objective is None, yolo=yolo,
     )
+    yolo = yolo and auto  # yolo only applies if autonomous was actually authorized
     budget = (
         Budget(
             max_rounds=settings.auto_max_rounds,
@@ -461,126 +734,228 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
-    tools = ToolRegistry(
-        session, command_timeout=settings.command_timeout, auto=auto, budget=budget
-    )
-    stream_view = _StreamView()
-    agent = Agent(
-        client,
-        tools,
-        session,
-        max_tool_rounds=settings.max_tool_rounds,
-        max_history_messages=settings.max_history_messages,
-        on_assistant_text=lambda text: print("\n" + ui.reasoning(text)),
-        stream=settings.stream,
-        on_delta=stream_view.delta,
-        on_message_boundary=stream_view.boundary,
-        autonomous=auto,
-        budget=budget,
-        system_prompt=AUTONOMOUS_SYSTEM_PROMPT if auto else SYSTEM_PROMPT,
+    mcp = _build_mcp(
+        settings,
+        enabled=(args.mcp or settings.mcp_enabled) and not args.no_mcp,
+        config_path=args.mcp_config or settings.mcp_config_path,
+        use_defaults=settings.mcp_use_defaults and not args.no_mcp_defaults,
     )
 
-    print(
-        "\n" + ui.success("Session started.")
-        + ui.dim(f"  Reports dir: {settings.reports_dir.resolve()}")
-    )
+    # Research sub-agent: a second model client (or the main one) the lead agent
+    # can delegate OSINT questions to. Built only when active and not disabled.
+    research_client = None
+    if settings.research_active and not args.no_research:
+        rs = settings.research_client_settings()
+        research_client = MuhGPTClient(rs)
+        print(ui.dim(f"  [research] sub-agent on '{rs.model}'") + (
+            ui.dim(f" @ {rs.base_url}") if settings.research_base_url else ""
+        ))
 
-    # One-shot: run a single objective (recon "/skill target", assistant
-    # "/skill text", or free objective), export, and exit.
-    if args.objective is not None:
-        objective = args.objective.strip()
-        if not objective:
-            print(ui.error("Empty --objective."), file=sys.stderr)
-            return 2
-        recon = _expand_skill(objective)
-        if recon is _SKILL_USAGE:
-            return 2
-        prompt_skill = None if recon is not None else _expand_prompt_skill(objective)
-        if prompt_skill is _SKILL_USAGE:
-            return 2
-        if recon is not None:
-            thunk = partial(agent.run_turn, recon)
-        elif prompt_skill is not None:
-            thunk = partial(agent.ask_once, prompt_skill[0], prompt_skill[1])
-        else:
-            thunk = partial(agent.run_turn, objective)
-        _drive(thunk, agent=agent, settings=settings, session=session, stream_view=stream_view)
-        if session.has_activity:
+    # Everything after the MCP servers are spawned runs inside this try/finally,
+    # so their subprocesses are shut down on every exit path — including a failure
+    # while building the registry or agent (not just during the REPL).
+    try:
+        # Operator-extended recon allowlist: sanitize (dropping never-allowlistable
+        # binaries), build a classifier bound to the clean set, and surface what was
+        # accepted vs rejected. The denylist/metachar gates still run first.
+        accepted_recon, rejected_recon = guard.sanitize_extra_recon(
+            _extra_recon_tokens(args.extra_recon, settings.extra_safe_recon)
+        )
+        classifier = guard.make_classifier(accepted_recon)
+        if accepted_recon or rejected_recon:
+            line = ui.dim("  [guard] extra recon allowlisted: ") + (
+                ui.info(", ".join(sorted(accepted_recon))) if accepted_recon else ui.dim("(none)")
+            )
+            if rejected_recon:
+                line += ui.warn("   rejected: " + ", ".join(rejected_recon))
+            print(line)
+
+        tools = ToolRegistry(
+            session, command_timeout=settings.command_timeout, auto=auto, budget=budget,
+            mcp=mcp, yolo=yolo, classifier=classifier,
+            research_client=research_client,
+            research_max_rounds=settings.research_max_rounds,
+            research_max_commands=settings.research_max_commands,
+            research_wall_clock_s=settings.research_wall_clock_s,
+            scan_mode=settings.scan_mode,
+        )
+        stream_view = _StreamView(bidi_mode=settings.bidi)
+        agent = Agent(
+            client,
+            tools,
+            session,
+            max_tool_rounds=settings.max_tool_rounds,
+            max_history_messages=settings.max_history_messages,
+            on_assistant_text=lambda text: print("\n" + ui.reasoning(text)),
+            stream=settings.stream,
+            on_delta=stream_view.delta,
+            on_message_boundary=stream_view.boundary,
+            autonomous=auto,
+            budget=budget,
+            scan_mode=settings.scan_mode,
+            system_prompt=AUTONOMOUS_SYSTEM_PROMPT if auto else SYSTEM_PROMPT,
+        )
+
+        print(
+            "\n" + ui.success("Session started.")
+            + ui.dim(f"  Reports dir: {settings.reports_dir.resolve()}")
+        )
+        if settings.show_balance and not args.no_balance:
+            _print_startup_balance(client)
+
+        # One-shot: run a single objective (recon "/skill target", assistant
+        # "/skill text", or free objective), export, and exit.
+        if args.objective is not None:
+            objective = args.objective.strip()
+            if not objective:
+                print(ui.error("Empty --objective."), file=sys.stderr)
+                return 2
+            recon = _expand_skill(objective)
+            if recon is _SKILL_USAGE:
+                return 2
+            prompt_skill = None if recon is not None else _expand_prompt_skill(objective)
+            if prompt_skill is _SKILL_USAGE:
+                return 2
+            if recon is not None:
+                thunk = partial(agent.run_turn, recon)
+            elif prompt_skill is not None:
+                thunk = partial(agent.ask_once, prompt_skill[0], prompt_skill[1])
+            else:
+                thunk = partial(agent.run_turn, objective)
+            _drive(thunk, agent=agent, settings=settings, session=session, stream_view=stream_view)
+            if session.has_activity:
+                print(ui.success("Report written to ") + ui.dim(str(session.export())))
+            print(ui.dim("Done."))
+            return 0
+
+        print(ui.dim("Type /help for commands.") + "\n")
+
+        prompt_str = ui.prompt(f"[{operator}@muhgpt] ❯ ")
+        while True:
+            try:
+                user_input = input(prompt_str).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not user_input:
+                continue
+            if user_input in {"/exit", "/quit"}:
+                break
+            if user_input == "/help":
+                print(_render_help())
+                continue
+            if user_input == "/scope":
+                print(ui.info("Authorized scope: ") + scope)
+                continue
+            if user_input == "/mcp":
+                print(ui.info("MCP: ") + (mcp.describe() if mcp is not None else "disabled"))
+                continue
+            if user_input == "/models":
+                try:
+                    models = client.list_models()
+                except MuhGPTError as exc:
+                    print(ui.error(f"[models error] {exc}") + ui.dim(_error_hint(exc)))
+                else:
+                    print(_render_models(models, settings.model))
+                continue
+            if user_input in {"/balance", "/usage"} or user_input.startswith(
+                ("/balance ", "/usage ")
+            ):
+                parts = user_input.split()
+                start = parts[1] if len(parts) > 1 else None
+                end = parts[2] if len(parts) > 2 else None
+                try:
+                    usage = client.get_usage(start=start, end=end)
+                except MuhGPTError as exc:
+                    print(ui.error(f"[balance error] {exc}") + ui.dim(_error_hint(exc)))
+                else:
+                    print(_render_usage(usage))
+                continue
+            if user_input == "/research" or user_input.startswith("/research "):
+                query = user_input[len("/research"):].strip()
+                if research_client is None:
+                    print(ui.warn(
+                        "Research sub-agent not enabled. Start with --research (or set "
+                        "MUHGPT_RESEARCH_MODEL / MUHGPT_RESEARCH_ENABLED)."
+                    ))
+                elif not query:
+                    print(ui.warn(
+                        "Usage: /research <question>   e.g. /research breach history of example.com"
+                    ))
+                else:
+                    result = tools.dispatch("research", json.dumps({"query": query}))
+                    rendered = render_markdown(result.content)
+                    if sys.stdout.isatty():
+                        rendered = bidi.to_display(rendered, settings.bidi)
+                    print("\n" + rendered + "\n")
+                continue
+            if user_input == "/skills" or user_input.startswith("/skills "):
+                arg = user_input[len("/skills"):].strip()
+                if arg:
+                    body = knowledge.load_skill(arg)
+                    print(render_markdown(body) if body else ui.warn(f"Unknown skill: {arg}"))
+                else:
+                    print(ui.info("Vulnerability playbooks: ") + (
+                        ", ".join(knowledge.list_skills()) or "(none)"))
+                    print(ui.dim("  Preview with /skills <name>; agent loads via load_skill."))
+                continue
+            if user_input == "/report":
+                print(ui.success("Report written to ") + ui.dim(str(session.export())))
+                continue
+            if user_input == "/install" or user_input.startswith("/install "):
+                packages = _parse_install_args(user_input[len("/install"):].strip())
+                if not packages:
+                    print(ui.warn(
+                        "Usage: /install <package> [<package> ...]   e.g. /install nmap"
+                    ))
+                else:
+                    for package in packages:
+                        _do_install(tools, package)
+                continue
+
+            # Recon skill: /<name> <target> -> playbook objective via the pentest agent.
+            expanded = _expand_skill(user_input)
+            if expanded is _SKILL_USAGE:
+                continue
+            if expanded is not None:
+                _drive(
+                    partial(agent.run_turn, expanded),
+                    agent=agent, settings=settings, session=session, stream_view=stream_view,
+                )
+                continue
+
+            # Assistant skill: /<name> <free text> -> isolated one-off with its own persona.
+            prompt_skill = _expand_prompt_skill(user_input)
+            if prompt_skill is _SKILL_USAGE:
+                continue
+            if prompt_skill is not None:
+                _drive(
+                    partial(agent.ask_once, prompt_skill[0], prompt_skill[1]),
+                    agent=agent, settings=settings, session=session, stream_view=stream_view,
+                )
+                continue
+
+            # Bare "install X" / "instala o X" — route straight to the installer.
+            if package := _match_install_intent(user_input):
+                print(ui.dim("(install intent detected — use /install to be explicit)"))
+                _do_install(tools, package)
+                continue
+
+            _drive(
+                partial(agent.run_turn, user_input),
+                agent=agent, settings=settings, session=session, stream_view=stream_view,
+            )
+
+        if session.has_activity and console_confirm(
+            ui.info("Export engagement report before exiting?")
+        ):
             print(ui.success("Report written to ") + ui.dim(str(session.export())))
         print(ui.dim("Done."))
         return 0
-
-    print(ui.dim("Type /help for commands.") + "\n")
-
-    prompt_str = ui.prompt(f"[{operator}@muhgpt] ❯ ")
-    while True:
-        try:
-            user_input = input(prompt_str).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if not user_input:
-            continue
-        if user_input in {"/exit", "/quit"}:
-            break
-        if user_input == "/help":
-            print(_render_help())
-            continue
-        if user_input == "/scope":
-            print(ui.info("Authorized scope: ") + scope)
-            continue
-        if user_input == "/report":
-            print(ui.success("Report written to ") + ui.dim(str(session.export())))
-            continue
-        if user_input == "/install" or user_input.startswith("/install "):
-            packages = _parse_install_args(user_input[len("/install"):].strip())
-            if not packages:
-                print(ui.warn("Usage: /install <package> [<package> ...]   e.g. /install nmap"))
-            else:
-                for package in packages:
-                    _do_install(tools, package)
-            continue
-
-        # Recon skill: /<name> <target> -> playbook objective via the pentest agent.
-        expanded = _expand_skill(user_input)
-        if expanded is _SKILL_USAGE:
-            continue
-        if expanded is not None:
-            _drive(
-                partial(agent.run_turn, expanded),
-                agent=agent, settings=settings, session=session, stream_view=stream_view,
-            )
-            continue
-
-        # Assistant skill: /<name> <free text> -> isolated one-off with its own persona.
-        prompt_skill = _expand_prompt_skill(user_input)
-        if prompt_skill is _SKILL_USAGE:
-            continue
-        if prompt_skill is not None:
-            _drive(
-                partial(agent.ask_once, prompt_skill[0], prompt_skill[1]),
-                agent=agent, settings=settings, session=session, stream_view=stream_view,
-            )
-            continue
-
-        # Bare "install X" / "instala o X" — route straight to the installer.
-        if package := _match_install_intent(user_input):
-            print(ui.dim("(install intent detected — use /install to be explicit)"))
-            _do_install(tools, package)
-            continue
-
-        _drive(
-            partial(agent.run_turn, user_input),
-            agent=agent, settings=settings, session=session, stream_view=stream_view,
-        )
-
-    if session.has_activity and console_confirm(
-        ui.info("Export engagement report before exiting?")
-    ):
-        print(ui.success("Report written to ") + ui.dim(str(session.export())))
-    print(ui.dim("Done."))
-    return 0
+    finally:
+        if mcp is not None:
+            mcp.close()
 
 
 if __name__ == "__main__":

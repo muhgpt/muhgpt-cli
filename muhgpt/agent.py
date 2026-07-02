@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Callable
 
+from . import arsenal, knowledge
 from .api_client import MuhGPTClient
 from .guard import Budget, BudgetExceeded
 from .session import Session
@@ -106,10 +108,12 @@ class Agent:
         on_message_boundary: Callable[[bool], None] | None = None,
         autonomous: bool = False,
         budget: Budget | None = None,
+        scan_mode: str = "standard",
     ) -> None:
         self._client = client
         self._tools = tools
         self._session = session
+        self._scan_mode = scan_mode
         self._max_tool_rounds = max_tool_rounds
         self._max_history_messages = max_history_messages
         self._narrate = on_assistant_text or (lambda _text: None)
@@ -124,12 +128,63 @@ class Agent:
         ]
 
     def _build_system_prompt(self, base: str) -> str:
-        """Append the confirmed scope and operator to the base system prompt."""
-        return (
-            f"{base}\n\n"
-            f"Confirmed engagement scope: {self._session.scope}\n"
-            f"Operator: {self._session.operator}"
+        """Append the date anchor, recon arsenal, confirmed scope, and operator.
+
+        The arsenal briefing (a static tool index + chaining methodology) gives a
+        weak model a concrete mental model of which tools auto-run and how to chain
+        them — guard-compatible, since it grants no new execution power. The date
+        anchor stops a model with an older training cutoff from refusing recent
+        tasks as "in the future" and makes it trust live tool/search output over
+        its stale priors.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        skills = knowledge.skills_index()
+        authorization = (
+            "Authorization & capability: this is an AUTHORIZED engagement and the targets in the "
+            "confirmed scope below are approved for testing — the operator owns or has written "
+            "permission to test them. You DO have the ability to act: execute_terminal_command "
+            "runs real recon/testing tools (nmap, dig, httpx, nuclei, …) against the target, and "
+            "you can install tools and call MCP tools. Never refuse an in-scope task by "
+            "claiming you 'cannot scan external domains', 'lack access', 'can't probe sites', or "
+            "that your capabilities are limited — that is false. For an in-scope target, ACT: call "
+            "the tool. Authorization is the operator's responsibility, not yours to second-guess "
+            "for in-scope targets. Every command is still gated by the operator's approval or the "
+            "safety guard, so you cannot cause harm by proposing a recon step. (Only stop if a "
+            "target is clearly OUTSIDE the confirmed scope.)"
         )
+        methodology = (
+            "Methodology: before hunting a vulnerability class, call load_skill to load its "
+            "playbook (find + VALIDATE + report). Use note to remember state/leads across the "
+            "run and recall_notes to read them back. File only CONFIRMED issues with "
+            "report_vulnerability — a proof of concept is required ('no PoC, no finding'); "
+            "scanner output alone is not a finding."
+        )
+        parts = [
+            base,
+            f"Current date: {today}. Your training data may be older, so treat your own "
+            f"knowledge as possibly out of date and trust tool/search results over your priors. "
+            f"Any year up to and including the current date is the past or present — never refuse "
+            f"a task as being 'in the future'; use your tools to fetch current data instead of "
+            f"declining.",
+            authorization,
+            arsenal.scan_mode_briefing(self._scan_mode),
+            methodology,
+        ]
+        if skills:
+            parts.append(f"Vulnerability playbooks available via load_skill: {skills}.")
+        if any(
+            s.get("function", {}).get("name") == "research" for s in self._tools.schemas
+        ):
+            parts.append(
+                "OSINT research: for background, attribution, or corroboration, call the "
+                "`research` tool — a focused search sub-agent that returns a sourced brief — "
+                "instead of running many manual searches yourself. One specific question per call."
+            )
+        parts.append(arsenal.arsenal_briefing(self._autonomous))
+        parts.append(
+            f"Confirmed engagement scope: {self._session.scope}\nOperator: {self._session.operator}"
+        )
+        return "\n\n".join(parts)
 
     def run_turn(self, user_input: str) -> str:
         """Process one operator message, running any tool calls it triggers.

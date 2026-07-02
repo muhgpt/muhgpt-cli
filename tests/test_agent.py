@@ -49,6 +49,51 @@ def test_plain_reply_returned_without_tool_calls(session):
     assert client.calls == 1
 
 
+def test_system_prompt_includes_scope_and_arsenal(session):
+    agent = Agent(ScriptedClient([]), FakeTools(), session)
+    system = agent._messages[0]["content"]
+    assert "Confirmed engagement scope: example.com" in system
+    assert "RECON ARSENAL" in system and "CHAINING METHODOLOGY" in system
+
+
+def test_system_prompt_anchors_the_current_date(session):
+    import re as _re
+
+    agent = Agent(ScriptedClient([]), FakeTools(), session)
+    system = agent._messages[0]["content"]
+    assert _re.search(r"Current date: \d{4}-\d{2}-\d{2}", system)
+    assert "never refuse a task as being 'in the future'" in system
+
+
+def test_autonomous_prompt_marks_tools_as_auto_run(session):
+    agent = Agent(ScriptedClient([]), FakeTools(), session, autonomous=True)
+    assert "AUTO-RUN" in agent._messages[0]["content"]
+
+
+def test_system_prompt_has_anti_refusal_authorization(session):
+    system = Agent(ScriptedClient([]), FakeTools(), session)._messages[0]["content"]
+    assert "AUTHORIZED engagement" in system
+    assert "Never refuse an in-scope task" in system
+    assert "execute_terminal_command runs" in system
+
+
+def test_system_prompt_advertises_skills_and_methodology(session):
+    system = Agent(ScriptedClient([]), FakeTools(), session)._messages[0]["content"]
+    assert "load_skill" in system and "no PoC, no finding" in system
+
+
+def test_system_prompt_mentions_research_only_when_tool_present(session):
+    # No research tool advertised -> no mention.
+    plain = Agent(ScriptedClient([]), FakeTools(), session)._messages[0]["content"]
+    assert "`research` tool" not in plain
+
+    class ToolsWithResearch(FakeTools):
+        schemas = [{"type": "function", "function": {"name": "research"}}]
+
+    withr = Agent(ScriptedClient([]), ToolsWithResearch(), session)._messages[0]["content"]
+    assert "`research` tool" in withr
+
+
 def test_tool_call_then_final_reply(session):
     client = ScriptedClient([_tool_call(), {"role": "assistant", "content": "found it"}])
     tools = FakeTools()

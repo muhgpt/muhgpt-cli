@@ -194,6 +194,96 @@ def test_install_package_tool_is_advertised(session):
     assert "install_package" in names
 
 
+# --- research sub-agent tool -----------------------------------------------
+def test_research_tool_advertised_only_when_configured(session):
+    off = [s["function"]["name"] for s in ToolRegistry(session).schemas]
+    assert "research" not in off  # off unless a research client is wired
+    on = [s["function"]["name"] for s in ToolRegistry(session, research_client=object()).schemas]
+    assert "research" in on
+
+
+def test_research_dispatch_delegates_to_run_research(session, monkeypatch):
+    import muhgpt.research as research_mod
+
+    captured = {}
+
+    def fake_run_research(query, *, client, tools, session, budget, scan_mode="standard"):
+        captured["query"] = query
+        captured["tools_type"] = type(tools).__name__
+        captured["sub_has_research"] = "research" in [
+            s["function"]["name"] for s in tools.schemas
+        ]
+        captured["bounds"] = (budget.max_rounds, budget.max_commands)
+        return "## Brief\n- finding [src]"
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    reg = ToolRegistry(
+        session, research_client=object(), research_max_rounds=7, research_max_commands=9
+    )
+    result = reg.dispatch("research", '{"query": "who owns example.com"}')
+    assert result.executed and "Brief" in result.content
+    assert captured["query"] == "who owns example.com"
+    # A dedicated sub-registry with NO research tool of its own (cannot recurse).
+    assert captured["tools_type"] == "ToolRegistry"
+    assert captured["sub_has_research"] is False
+    assert captured["bounds"] == (7, 9)  # research_* knobs flow into the sub-budget
+    assert any(e["kind"] == "research" for e in session._events)
+
+
+def test_research_subregistry_drops_yolo(session, monkeypatch):
+    # In a --auto --yolo parent, the research sub-registry must NOT inherit yolo:
+    # it ingests untrusted web, so its CONFIRM-tier primitives stay gated.
+    import muhgpt.research as research_mod
+
+    captured = {}
+
+    def fake_run_research(query, *, client, tools, session, budget, scan_mode="standard"):
+        captured["sub_yolo"] = tools._yolo
+        captured["sub_auto"] = tools._auto
+        return "brief"
+
+    monkeypatch.setattr(research_mod, "run_research", fake_run_research)
+    reg = ToolRegistry(
+        session, research_client=object(), auto=True, yolo=True,
+        budget=Budget(wall_clock_s=9999),
+    )
+    reg.dispatch("research", '{"query": "x"}')
+    assert captured["sub_yolo"] is False   # yolo dropped for the sub-agent
+    assert captured["sub_auto"] is True     # but auto (hands-off recon) is inherited
+
+
+def test_research_tool_cannot_be_dispatched_without_a_client(session):
+    # The sub-registry is built with research_client=None, so 'research' is unknown
+    # there — structurally preventing recursion.
+    result = ToolRegistry(session).dispatch("research", '{"query": "x"}')
+    assert not result.executed and "unknown tool" in result.content.lower()
+
+
+def test_research_dispatch_rejects_empty_query(session, monkeypatch):
+    import muhgpt.research as research_mod
+
+    monkeypatch.setattr(
+        research_mod, "run_research",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run on empty query")),
+    )
+    reg = ToolRegistry(session, research_client=object())
+    result = reg.dispatch("research", '{"query": "   "}')
+    assert not result.executed and "no research question" in result.content.lower()
+
+
+def test_research_dispatch_surfaces_subagent_failure(session, monkeypatch):
+    import muhgpt.research as research_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(research_mod, "run_research", boom)
+    reg = ToolRegistry(session, research_client=object())
+    result = reg.dispatch("research", '{"query": "x"}')
+    assert result.executed  # an error is still a real (failed) action, not a no-op
+    assert "research sub-agent failed" in result.content.lower()
+
+
 # --- autonomous mode -------------------------------------------------------
 # Inject deterministic verdicts so these test the WIRING, independent of the
 # (separately tested) denylist content and of which binaries are installed.
@@ -281,4 +371,213 @@ def test_auto_mode_charges_command_budget(session):
     assert reg.dispatch("execute_terminal_command", '{"command": "echo a"}').executed
     with pytest.raises(BudgetExceeded):
         reg.dispatch("execute_terminal_command", '{"command": "echo b"}')  # 2nd over cap
+
+
+# --- MCP tool dispatch through the approval boundary ------------------------
+from muhgpt.mcp import McpTool  # noqa: E402
+
+
+class FakeMcp:
+    """A ToolRegistry-compatible MCP manager stand-in (no subprocess)."""
+
+    def __init__(self, raw_name="do", server="srv", auto_tools=(), fail=False):
+        self._tool = McpTool(
+            server=server, raw_name=raw_name, name=f"mcp__{server}__{raw_name}",
+            description="d", input_schema={"type": "object", "properties": {}},
+        )
+        self._auto = frozenset(auto_tools)
+        self._fail = fail
+        self.invoked: list = []
+
+    @property
+    def schemas(self):
+        return [self._tool.openai_schema]
+
+    @property
+    def auto_tools(self):
+        return self._auto
+
+    def has_tool(self, name):
+        return name == self._tool.name
+
+    def tool(self, name):
+        return self._tool if name == self._tool.name else None
+
+    def is_auto_allowed(self, name):
+        return name in self._auto
+
+    def invoke(self, name, args):
+        self.invoked.append((name, args))
+        if self._fail:
+            raise RuntimeError("boom")
+        return f"ran {name}"
+
+
+def test_mcp_schemas_are_merged(session):
+    reg = ToolRegistry(session, confirm=ALLOW, mcp=FakeMcp())
+    names = {s["function"]["name"] for s in reg.schemas}
+    assert "mcp__srv__do" in names
+    assert "execute_terminal_command" in names  # built-ins still present
+
+
+def test_mcp_call_hitl_approve(session):
+    mcp = FakeMcp()
+    reg = ToolRegistry(session, confirm=ALLOW, mcp=mcp)
+    result = reg.dispatch("mcp__srv__do", '{"x": 1}')
+    assert result.executed and result.content == "ran mcp__srv__do"
+    assert mcp.invoked == [("mcp__srv__do", {"x": 1})]
+
+
+def test_mcp_call_hitl_decline(session):
+    mcp = FakeMcp()
+    reg = ToolRegistry(session, confirm=DENY, mcp=mcp)
+    result = reg.dispatch("mcp__srv__do", "{}")
+    assert not result.executed and "declined" in result.content
+    assert mcp.invoked == []
+
+
+def test_mcp_auto_allowlisted_runs_without_confirm(session):
+    mcp = FakeMcp(auto_tools=("mcp__srv__do",))
+    reg = ToolRegistry(session, confirm=_never, auto=True, mcp=mcp)
+    result = reg.dispatch("mcp__srv__do", "{}")
+    assert result.executed and mcp.invoked  # confirmer never called
+
+
+def test_mcp_auto_not_allowlisted_confirms(session):
+    mcp = FakeMcp()  # not in auto_tools
+    reg = ToolRegistry(session, confirm=DENY, auto=True, mcp=mcp)
+    result = reg.dispatch("mcp__srv__do", "{}")
+    assert not result.executed and mcp.invoked == []  # fell to a (declined) CONFIRM
+
+
+def test_mcp_auto_blocks_weaponized(session):
+    budget = Budget(wall_clock_s=9999)
+    budget.start()
+    mcp = FakeMcp(raw_name="run_exploit", auto_tools=("mcp__srv__run_exploit",))
+    reg = ToolRegistry(session, confirm=_never, auto=True, budget=budget, mcp=mcp)
+    result = reg.dispatch("mcp__srv__run_exploit", "{}")
+    assert not result.executed and "blocked by policy" in result.content
+    assert mcp.invoked == [] and budget.blocks == 1
+
+
+def test_mcp_auto_out_of_scope_is_confirmed(session):
+    session.scope = "example.com"
+    mcp = FakeMcp(auto_tools=("mcp__srv__do",))
+    reg = ToolRegistry(session, confirm=DENY, auto=True, mcp=mcp)
+    # allowlisted, but the argument names an out-of-scope host -> downgraded to CONFIRM
+    result = reg.dispatch("mcp__srv__do", '{"host": "10.0.0.5"}')
+    assert not result.executed and mcp.invoked == []
+
+
+def test_mcp_invoke_failure_is_surfaced(session):
+    mcp = FakeMcp(auto_tools=("mcp__srv__do",), fail=True)
+    reg = ToolRegistry(session, confirm=_never, auto=True, mcp=mcp)
+    result = reg.dispatch("mcp__srv__do", "{}")
+    assert "[error]" in result.content and "boom" in result.content
+
+
+def test_load_skill_returns_playbook_and_does_not_count_as_progress(session):
+    reg = ToolRegistry(session, confirm=DENY)  # no confirm needed; it's internal data
+    result = reg.dispatch("load_skill", '{"name": "xss"}')
+    assert result.content.lstrip().startswith("#") and not result.executed
+    unknown = reg.dispatch("load_skill", '{"name": "nope"}')
+    assert "Unknown skill" in unknown.content and not unknown.executed
+
+
+def test_note_and_recall(session):
+    reg = ToolRegistry(session, confirm=DENY)
+    note = reg.dispatch("note", '{"content": "IDOR at /api/u/{id}", "category": "lead"}')
+    assert not note.executed
+    assert session.notes and session.notes[0]["category"] == "lead"
+    recalled = reg.dispatch("recall_notes", "{}")
+    assert "IDOR at /api/u/{id}" in recalled.content and not recalled.executed
+
+
+def test_report_vulnerability_requires_poc(session):
+    reg = ToolRegistry(session, confirm=DENY)
+    r = reg.dispatch("report_vulnerability", '{"title": "T", "description": "d", "poc": ""}')
+    assert not r.executed and "PoC" in r.content
+    assert session.vulnerabilities == []
+
+
+def test_report_vulnerability_computes_cvss_and_dedupes(session):
+    import json as _json
+    reg = ToolRegistry(session, confirm=DENY)
+    payload = {
+        "title": "Reflected XSS in q", "description": "q reflected unencoded",
+        "poc": "GET /?q=<svg onload=alert(document.domain)> -> dialog fires",
+        "cvss": {"AV": "N", "AC": "L", "PR": "N", "UI": "R",
+                 "S": "C", "C": "L", "I": "L", "A": "N"},
+    }
+    ok = reg.dispatch("report_vulnerability", _json.dumps(payload))
+    assert ok.executed and "CVSS 6.1" in ok.content
+    v = session.vulnerabilities[0]
+    assert v["severity"] == "Medium" and v["cvss_score"] == 6.1
+    # duplicate title is ignored
+    dup = reg.dispatch("report_vulnerability", _json.dumps(payload))
+    assert "duplicate" in dup.content.lower() and len(session.vulnerabilities) == 1
+
+
+def test_report_vulnerability_bad_cvss_still_files(session):
+    import json as _json
+    reg = ToolRegistry(session, confirm=DENY)
+    r = reg.dispatch("report_vulnerability", _json.dumps({
+        "title": "Issue", "description": "d", "poc": "proof", "severity": "High",
+        "cvss": {"AV": "X"},  # invalid -> dropped, but the finding is still recorded
+    }))
+    assert r.executed and session.vulnerabilities[0]["severity"] == "High"
+
+
+def test_mcp_charges_command_budget(session):
+    budget = Budget(max_commands=1, wall_clock_s=9999)
+    budget.start()
+    mcp = FakeMcp(auto_tools=("mcp__srv__do",))
+    reg = ToolRegistry(session, confirm=_never, auto=True, budget=budget, mcp=mcp)
+    assert reg.dispatch("mcp__srv__do", "{}").executed
+    with pytest.raises(BudgetExceeded):
+        reg.dispatch("mcp__srv__do", "{}")
+
+
+# --- yolo mode: auto-approve the CONFIRM tier (but never BLOCK / secret reads) ---
+def test_yolo_auto_runs_confirm_tier_command(session):
+    # A CONFIRM verdict (e.g. curl) would normally prompt even in --auto; yolo runs it.
+    reg = ToolRegistry(session, confirm=_never, auto=True, yolo=True, classifier=CONFIRM_ALL)
+    result = reg.dispatch("execute_terminal_command", '{"command": "echo hi"}')
+    assert result.executed  # confirmer never called
+
+
+def test_yolo_still_blocks_destructive(session):
+    reg = ToolRegistry(session, confirm=_never, auto=True, yolo=True, classifier=BLOCK_ALL)
+    result = reg.dispatch("execute_terminal_command", '{"command": "rm -rf /"}')
+    assert not result.executed and "blocked by policy" in result.content
+
+
+def test_yolo_requires_auto(session):
+    # yolo without auto is inert — HITL still confirms everything.
+    reg = ToolRegistry(session, confirm=DENY, auto=False, yolo=True, classifier=CONFIRM_ALL)
+    result = reg.dispatch("execute_terminal_command", '{"command": "echo hi"}')
+    assert not result.executed  # prompted (and declined)
+
+
+def test_yolo_auto_reads_nonsecret_file_but_not_secret(session, tmp_path):
+    secret = tmp_path / "id_rsa"
+    secret.write_text("KEY", encoding="utf-8")
+    normal = tmp_path / "notes.txt"
+    normal.write_text("data", encoding="utf-8")
+    reg = ToolRegistry(session, confirm=DENY, auto=True, yolo=True)
+    # non-secret file outside the read-root auto-reads under yolo
+    assert reg.dispatch("read_file", f'{{"path": "{normal}"}}').content == "data"
+    # secret path stays gated even in yolo (DENY confirmer -> declined)
+    declined = reg.dispatch("read_file", f'{{"path": "{secret}"}}')
+    assert not declined.executed and "declined" in declined.content
+
+
+def test_yolo_auto_approves_mcp_confirm_but_blocks_weaponized(session):
+    mcp = FakeMcp(raw_name="search")  # benign -> CONFIRM, not in auto_tools
+    reg = ToolRegistry(session, confirm=_never, auto=True, yolo=True, mcp=mcp)
+    assert reg.dispatch("mcp__srv__search", "{}").executed  # CONFIRM auto-runs under yolo
+    weap = FakeMcp(raw_name="run_exploit")
+    reg2 = ToolRegistry(session, confirm=_never, auto=True, yolo=True, mcp=weap)
+    blocked = reg2.dispatch("mcp__srv__run_exploit", "{}")
+    assert not blocked.executed and "blocked by policy" in blocked.content
 

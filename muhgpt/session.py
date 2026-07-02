@@ -39,6 +39,8 @@ class Session:
     reports_dir: Path
     started_at: str = field(default_factory=_stamp)
     findings: list[Finding] = field(default_factory=list)
+    notes: list[dict[str, Any]] = field(default_factory=list)
+    vulnerabilities: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, int] = field(
         default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     )
@@ -73,6 +75,20 @@ class Session:
         self.log_event("finding", {"title": title, "content": content})
         return finding
 
+    def add_note(self, content: str, category: str = "general") -> dict[str, Any]:
+        """Record a scratchpad note (engagement memory that survives history trim)."""
+        note = {"category": category, "content": content, "ts": _stamp()}
+        self.notes.append(note)
+        self.log_event("note", note)
+        return note
+
+    def add_vulnerability(self, vuln: dict[str, Any]) -> dict[str, Any]:
+        """Record a validated, structured vulnerability finding."""
+        record = {**vuln, "ts": _stamp()}
+        self.vulnerabilities.append(record)
+        self.log_event("vulnerability", record)
+        return record
+
     def add_usage(self, usage: dict[str, Any]) -> None:
         """Accumulate token-usage counts reported by the API."""
         for key in self.usage:
@@ -83,10 +99,12 @@ class Session:
 
     @property
     def has_activity(self) -> bool:
-        """True if any findings or approved commands have been recorded."""
-        if self.findings:
+        """True if any findings/vulns, approved commands, or MCP tool calls were recorded."""
+        if self.findings or self.vulnerabilities:
             return True
-        return any(e["kind"] == "command" and e.get("approved") for e in self._events)
+        return any(
+            e["kind"] in ("command", "mcp_call") and e.get("approved") for e in self._events
+        )
 
     def render_markdown(self) -> str:
         """Produce a clean Markdown report of the engagement."""
@@ -98,9 +116,32 @@ class Session:
             f"- **Started:** {self.started_at}",
             f"- **Generated:** {_stamp()}",
             "",
-            "## Findings",
-            "",
         ]
+
+        if self.vulnerabilities:
+            lines += ["## Vulnerabilities", ""]
+            order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "None": 4, "": 5}
+            ranked = sorted(
+                self.vulnerabilities, key=lambda v: order.get(v.get("severity", ""), 5)
+            )
+            for index, vuln in enumerate(ranked, start=1):
+                sev = vuln.get("severity") or "Unrated"
+                score = vuln.get("cvss_score")
+                head = f"### {index}. [{sev}] {vuln.get('title', 'Untitled')}"
+                if score is not None:
+                    head += f" — CVSS {score}"
+                lines += [head, ""]
+                if vuln.get("cvss_vector"):
+                    lines.append(f"- **CVSS:** {vuln['cvss_score']} ({vuln['cvss_vector']})")
+                if vuln.get("affected"):
+                    lines.append(f"- **Affected:** {vuln['affected']}")
+                lines += ["", vuln.get("description", "").strip(), ""]
+                if vuln.get("poc"):
+                    lines += ["**Proof of concept:**", "", "```", vuln["poc"].strip(), "```", ""]
+                if vuln.get("remediation"):
+                    lines += ["**Remediation:** " + vuln["remediation"].strip(), ""]
+
+        lines += ["## Findings", ""]
         if not self.findings:
             lines.append("_No findings recorded._")
         else:
@@ -113,6 +154,11 @@ class Session:
                     "",
                 ]
 
+        if self.notes:
+            lines += ["", "## Notes & Methodology", ""]
+            for note in self.notes:
+                lines.append(f"- _({note.get('category', 'general')})_ {note.get('content', '')}")
+
         lines += ["", "## Command Log", ""]
         commands = [e for e in self._events if e["kind"] == "command" and e.get("approved")]
         if not commands:
@@ -124,6 +170,25 @@ class Session:
                     "",
                     "```",
                     (event["output"] or "").strip() or "(no output)",
+                    "```",
+                    "",
+                ]
+
+        mcp_calls = [e for e in self._events if e["kind"] == "mcp_call" and e.get("approved")]
+        if mcp_calls:
+            lines += ["", "## MCP Activity", ""]
+            for event in mcp_calls:
+                args = json.dumps(event.get("arguments") or {}, ensure_ascii=False)
+                if event.get("error"):
+                    body = f"[error] {event['error']}"
+                else:
+                    body = event.get("output") or ""
+                lines += [
+                    f"**`{event.get('server', '?')} · {event.get('tool', '?')}({args})`** "
+                    f"_(at {event['ts']})_",
+                    "",
+                    "```",
+                    (body or "").strip() or "(no output)",
                     "```",
                     "",
                 ]

@@ -17,6 +17,28 @@ def test_finding_marks_activity_and_renders(session):
     assert "redirects to attacker.example" in md
 
 
+def test_vulnerability_marks_activity_and_renders_sorted(session):
+    session.add_vulnerability(
+        {"title": "Low bug", "description": "d", "poc": "p", "severity": "Low"}
+    )
+    session.add_vulnerability({
+        "title": "RCE", "description": "exec", "poc": "id; uid=0", "severity": "Critical",
+        "cvss_score": 9.8, "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    })
+    assert session.has_activity is True
+    md = session.render_markdown()
+    assert "## Vulnerabilities" in md
+    assert md.index("[Critical] RCE") < md.index("[Low] Low bug")  # sorted by severity
+    assert "CVSS 9.8" in md and "id; uid=0" in md
+
+
+def test_notes_render_but_do_not_mark_activity(session):
+    session.add_note("revisit /admin", "lead")
+    assert session.has_activity is False  # notes alone aren't a deliverable
+    md = session.render_markdown()
+    assert "## Notes & Methodology" in md and "revisit /admin" in md
+
+
 def test_approved_command_marks_activity_and_appears_in_report(session):
     session.log_command("nmap -sV host", output="(exit code: 0)", approved=True)
     assert session.has_activity is True

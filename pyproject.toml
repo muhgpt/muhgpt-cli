@@ -44,6 +44,9 @@ muhgpt = "main:main"
 py-modules = ["main"]
 packages = ["muhgpt"]
 
+[tool.setuptools.package-data]
+muhgpt = ["mcp_defaults.json", "skills/*.md", "skills/*/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = [

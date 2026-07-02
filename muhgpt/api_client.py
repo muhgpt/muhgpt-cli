@@ -21,11 +21,17 @@ class APIConnectionError(MuhGPTError):
 
 
 class APIStatusError(MuhGPTError):
-    """Raised for non-retryable HTTP error responses (typically 4xx)."""
+    """Raised for non-retryable HTTP error responses (typically 4xx).
 
-    def __init__(self, status_code: int, message: str) -> None:
+    ``error_type`` carries the API's machine-readable error category when present
+    (e.g. ``insufficient_quota``, ``model_not_allowed``, ``model_not_found``), so
+    callers can surface an actionable hint. ``None`` when the body has no typed error.
+    """
+
+    def __init__(self, status_code: int, message: str, error_type: str | None = None) -> None:
         super().__init__(f"API returned {status_code}: {message}")
         self.status_code = status_code
+        self.error_type = error_type
 
 
 class APIResponseError(MuhGPTError):
@@ -93,9 +99,72 @@ class MuhGPTClient:
                 continue
 
             if response.status_code >= 400:
-                raise APIStatusError(response.status_code, _safe_text(response))
+                _raise_status(response)
 
             return self._parse_message(response)
+
+        raise APIConnectionError(
+            f"Request failed after {self._settings.max_retries + 1} attempts: {last_error}"
+        )
+
+    def list_models(self) -> list[dict[str, Any]]:
+        """Return the available models (``GET /v1/models`` → the ``data`` array).
+
+        Each entry is a dict like ``{"id", "object", "created", "owned_by"}``. Uses
+        the same auth + retry policy as chat.
+        """
+        data = self._request_json("GET", self._settings.models_url)
+        models = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            raise APIResponseError(f"Unexpected models response shape: {data!r}")
+        return models
+
+    def get_usage(self, start: str | None = None, end: str | None = None) -> dict[str, Any]:
+        """Return the account's usage + credit balance (``GET /v1/usage``).
+
+        ``start`` / ``end`` are optional ISO dates (``YYYY-MM-DD``). The result
+        includes ``balance`` and a ``totals`` breakdown. muh-specific: on a plain
+        OpenAI-compatible endpoint this may 404 — callers should treat it as best-effort.
+        """
+        params = {k: v for k, v in (("start", start), ("end", end)) if v}
+        data = self._request_json("GET", self._settings.usage_url, params=params or None)
+        if not isinstance(data, dict):
+            raise APIResponseError(f"Unexpected usage response shape: {data!r}")
+        return data
+
+    def _request_json(
+        self, method: str, url: str, params: dict[str, str] | None = None
+    ) -> Any:
+        """Send a non-streaming request and return parsed JSON, with the shared
+        retry/backoff policy (429/5xx/network) and typed-error raising."""
+        last_error: Exception | None = None
+        for attempt in range(self._settings.max_retries + 1):
+            try:
+                response = self._http.request(
+                    method,
+                    url,
+                    params=params,
+                    timeout=(self._settings.connect_timeout, self._settings.request_timeout),
+                )
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last_error = exc
+                self._sleep_for_retry(attempt)
+                continue
+
+            if response.status_code == 429 or response.status_code >= 500:
+                last_error = APIStatusError(response.status_code, _safe_text(response))
+                self._sleep_for_retry(attempt, response)
+                continue
+            if response.status_code >= 400:
+                _raise_status(response)
+
+            try:
+                return response.json()
+            except json.JSONDecodeError as exc:
+                raise APIResponseError(
+                    "Could not decode JSON from the API response. "
+                    "Verify MUHGPT_BASE_URL points to an OpenAI-compatible endpoint."
+                ) from exc
 
         raise APIConnectionError(
             f"Request failed after {self._settings.max_retries + 1} attempts: {last_error}"
@@ -144,9 +213,9 @@ class MuhGPTClient:
                 continue
 
             if response.status_code >= 400:
-                message = _safe_text(response)
+                message, error_type = _error_info(response)
                 response.close()
-                raise APIStatusError(response.status_code, message)
+                raise APIStatusError(response.status_code, message, error_type=error_type)
 
             try:
                 return accumulate_stream(
@@ -278,16 +347,31 @@ def accumulate_stream(
 
 def _safe_text(response: requests.Response) -> str:
     """Best-effort extraction of a human-readable error message from a response."""
+    return _error_info(response)[0]
+
+
+def _error_info(response: requests.Response) -> tuple[str, str | None]:
+    """Extract ``(message, error_type)`` from an error response body.
+
+    Handles the OpenAI-style ``{"error": {"message", "type", "code"}}`` shape used
+    by the muh API; falls back to raw text / the whole body when it isn't present.
+    """
     try:
         body = response.json()
     except json.JSONDecodeError:
-        return response.text[:500]
+        return response.text[:500], None
     if isinstance(body, dict):
         error = body.get("error")
         if isinstance(error, dict):
-            return str(error.get("message", body))
-        return str(body)
-    return str(body)
+            return str(error.get("message", body)), (error.get("type") or None)
+        return str(error if error is not None else body), None
+    return str(body), None
+
+
+def _raise_status(response: requests.Response) -> None:
+    """Raise a typed :class:`APIStatusError` from a 4xx response."""
+    message, error_type = _error_info(response)
+    raise APIStatusError(response.status_code, message, error_type=error_type)
 
 
 def _retry_after_seconds(response: requests.Response | None) -> float | None:
