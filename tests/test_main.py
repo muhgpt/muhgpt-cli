@@ -249,6 +249,9 @@ class _StubBalanceClient:
     def get_usage(self, *_a, **_k):
         return {}
 
+    def list_models(self, *_a, **_k):
+        return [{"id": "muh-chat", "owned_by": "muhgpt"}]
+
 
 def test_first_run_setup_prompts_saves_and_runs(monkeypatch, tmp_path, capsys):
     # No key anywhere + interactive stdin -> prompt, save to user config, then run.
@@ -275,6 +278,117 @@ def test_first_run_setup_prompts_saves_and_runs(monkeypatch, tmp_path, capsys):
 
     assert "mghp_pastedkey" in user_config_path().read_text()  # persisted
     assert "Saved to" in capsys.readouterr().out
+
+
+def test_first_run_rejects_non_muhgpt_paste_then_reprompts(monkeypatch, tmp_path, capsys):
+    # A paste that isn't an 'mghp_' key is rejected up front and re-prompted;
+    # only the valid key is ever persisted.
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path / "reports"))
+
+    class _TTY:
+        def isatty(self):
+            return True
+
+    pastes = iter(["not-a-key", "sk-openai-wrongvendor", "mghp_goodkey"])
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _p="": next(pastes))
+    monkeypatch.setattr(main, "MuhGPTClient", _StubBalanceClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--env-file", str(tmp_path / "noenv"), "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    from muhgpt.config import user_config_path
+
+    saved = user_config_path().read_text()
+    assert "mghp_goodkey" in saved and "not-a-key" not in saved  # only the valid one
+    out = capsys.readouterr().out
+    assert out.count("start with 'mghp_'") >= 2  # both bad pastes flagged
+
+
+def test_first_run_rejects_invalid_key_via_api_then_reprompts(monkeypatch, tmp_path, capsys):
+    # A well-formed 'mghp_' key the API rejects with 401 is not saved; re-prompt
+    # until a key validates.
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path / "reports"))
+
+    from muhgpt.api_client import APIStatusError
+
+    class _AuthCheckingClient:
+        def __init__(self, settings, *_a, **_kw):
+            self._key = settings.api_key
+
+        def get_usage(self, *_a, **_k):
+            return {}
+
+        def list_models(self, *_a, **_k):
+            if self._key != "mghp_goodkey":
+                raise APIStatusError(401, "invalid key", error_type="invalid_api_key")
+            return [{"id": "muh-chat", "owned_by": "muhgpt"}]
+
+    class _TTY:
+        def isatty(self):
+            return True
+
+    pastes = iter(["mghp_revoked", "mghp_goodkey"])
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _p="": next(pastes))
+    monkeypatch.setattr(main, "MuhGPTClient", _AuthCheckingClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--env-file", str(tmp_path / "noenv"), "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    from muhgpt.config import user_config_path
+
+    saved = user_config_path().read_text()
+    assert "mghp_goodkey" in saved and "mghp_revoked" not in saved
+    assert "rejected that key" in capsys.readouterr().out
+
+
+def test_first_run_accepts_valid_key_when_api_unreachable(monkeypatch, tmp_path, capsys):
+    # A network error while validating must NOT block setup — the key is saved and
+    # the real auth check happens on first use.
+    monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path / "reports"))
+
+    from muhgpt.api_client import MuhGPTError
+
+    class _OfflineClient:
+        def __init__(self, *_a, **_kw):
+            pass
+
+        def get_usage(self, *_a, **_k):
+            return {}
+
+        def list_models(self, *_a, **_k):
+            raise MuhGPTError("network down")
+
+    class _TTY:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _p="": "mghp_offlinekey")
+    monkeypatch.setattr(main, "MuhGPTClient", _OfflineClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--env-file", str(tmp_path / "noenv"), "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    from muhgpt.config import user_config_path
+
+    assert "mghp_offlinekey" in user_config_path().read_text()
 
 
 def test_missing_key_non_interactive_still_errors(monkeypatch, tmp_path, capsys):

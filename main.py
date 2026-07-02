@@ -13,7 +13,7 @@ from functools import partial
 
 from muhgpt import __version__, arsenal, bidi, guard, knowledge, ui
 from muhgpt.agent import AUTONOMOUS_SYSTEM_PROMPT, SYSTEM_PROMPT, Agent
-from muhgpt.api_client import MuhGPTClient, MuhGPTError
+from muhgpt.api_client import APIStatusError, MuhGPTClient, MuhGPTError
 from muhgpt.config import ConfigError, load_settings, save_user_api_key
 from muhgpt.guard import Budget
 from muhgpt.mcp import (
@@ -380,13 +380,47 @@ def _extra_recon_tokens(flag_value, from_settings=()) -> list[str]:
     return tokens
 
 
+def _validate_api_key(key: str, env_file):
+    """Check a pasted key against the live API. Return ``(ok, reason)``.
+
+    Builds Settings with the candidate key and calls ``list_models`` (a cheap,
+    credit-free Bearer probe). A ``401`` — the API's answer for an invalid or
+    unknown key — is a definitive reject. Every other outcome (402 no-credits but
+    valid key, 403/404, 5xx, or a network/offline error, or a non-muh endpoint)
+    is treated as *accept*: we don't block first-run setup on a transient or
+    endpoint-specific condition — a real auth problem still surfaces on first use.
+    """
+    prior = os.environ.get("MUHGPT_API_KEY")
+    os.environ["MUHGPT_API_KEY"] = key
+    try:
+        settings = load_settings(env_file)
+        MuhGPTClient(settings).list_models()
+        return True, ""
+    except APIStatusError as exc:
+        if exc.status_code == 401:
+            return False, "MUHGPT rejected that key (invalid or unknown)."
+        return True, ""  # valid key, unrelated HTTP error — don't block setup
+    except MuhGPTError:
+        return True, ""  # network/transport hiccup — accept, verify on first use
+    except ConfigError:
+        return False, "that key was not accepted."
+    finally:
+        # Restore the pre-probe value; the caller re-sets it only once a key validates.
+        if prior is None:
+            os.environ.pop("MUHGPT_API_KEY", None)
+        else:
+            os.environ["MUHGPT_API_KEY"] = prior
+
+
 def _first_run_key_setup(exc: ConfigError, env_file):
     """On a missing API key, offer a one-time interactive paste + save, then reload.
 
-    The operator never has to edit a file: they paste the key once, it's saved to
-    the persistent user config (``~/.config/muhgpt/.env``, 0600), and every future
-    run picks it up. Returns loaded Settings on success, or None to fall back to the
-    hard config error (a different config problem, non-interactive, or declined).
+    The operator never has to edit a file: they paste the key once, it's validated
+    against the API, saved to the persistent user config (``~/.config/muhgpt/.env``,
+    0600), and every future run picks it up. A wrong/garbage paste is rejected with
+    an error and re-prompted (no bad key is ever persisted). Returns loaded Settings
+    on success, or None to fall back to the hard config error (a different config
+    problem, non-interactive, or declined).
     """
     if "MUHGPT_API_KEY" not in str(exc):
         return None  # a different config error — don't hijack it
@@ -395,24 +429,33 @@ def _first_run_key_setup(exc: ConfigError, env_file):
     print()
     print(ui.warn("  No API key set yet — quick one-time setup."))
     print(ui.dim("  Get one at https://muhgpt.com → your account → API keys (mghp_…)."))
-    try:
-        key = input(ui.prompt("  Paste your MUHGPT API key: ")).strip()
-    except (EOFError, KeyboardInterrupt):
+    while True:
+        try:
+            key = input(ui.prompt("  Paste your MUHGPT API key: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not key:
+            return None  # empty line — operator declined
+        if not key.startswith("mghp_"):
+            print(ui.warn("  ✗ That doesn't look like a MUHGPT key (they start with 'mghp_')."))
+            print(ui.dim("  Paste your MUHGPT API key, or press Enter to cancel."))
+            continue
+        print(ui.dim("  Checking key…"))
+        ok, reason = _validate_api_key(key, env_file)
+        if not ok:
+            print(ui.error(f"  ✗ {reason}"))
+            print(ui.dim("  Paste a valid MUHGPT API key, or press Enter to cancel."))
+            continue
+        path = save_user_api_key(key)
+        os.environ["MUHGPT_API_KEY"] = key
+        print(ui.success(f"  ✓ Saved to {path}")
+              + ui.dim("  — future runs pick it up automatically."))
         print()
-        return None
-    if not key:
-        return None
-    if not key.startswith("mghp_"):
-        print(ui.warn("  (heads up: that doesn't look like an 'mghp_…' key — saving anyway)"))
-    path = save_user_api_key(key)
-    os.environ["MUHGPT_API_KEY"] = key
-    print(ui.success(f"  ✓ Saved to {path}")
-          + ui.dim("  — future runs pick it up automatically."))
-    print()
-    try:
-        return load_settings(env_file)
-    except ConfigError:
-        return None
+        try:
+            return load_settings(env_file)
+        except ConfigError:
+            return None
 
 
 def _run_classify(args) -> int:
