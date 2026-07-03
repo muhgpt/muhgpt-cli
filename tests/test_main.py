@@ -391,6 +391,55 @@ def test_first_run_accepts_valid_key_when_api_unreachable(monkeypatch, tmp_path,
     assert "mghp_offlinekey" in user_config_path().read_text()
 
 
+def test_reset_key_replaces_a_wrong_stored_key(monkeypatch, tmp_path, capsys):
+    # A wrong key is already stored (as a real env var here) so the tool would
+    # normally run with it. --reset-key forces a fresh prompt and overwrites it.
+    monkeypatch.setenv("MUHGPT_API_KEY", "mghp_oldwrongkey")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("MUHGPT_REPORTS_DIR", str(tmp_path / "reports"))
+
+    class _TTY:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", _TTY())
+    monkeypatch.setattr("builtins.input", lambda _p="": "mghp_freshkey")
+    monkeypatch.setattr(main, "MuhGPTClient", _StubBalanceClient)
+    monkeypatch.setattr(main, "Agent", _stub_agent())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(
+            ["--reset-key", "--env-file", str(tmp_path / "noenv"),
+             "--objective", "x", "--no-color"]
+        )
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 0
+    from muhgpt.config import user_config_path
+
+    saved = user_config_path().read_text()
+    assert "mghp_freshkey" in saved and "mghp_oldwrongkey" not in saved
+
+
+def test_reset_key_non_interactive_errors(monkeypatch, tmp_path, capsys):
+    # --reset-key with no TTY can't read a key — clean error, no hang.
+    monkeypatch.setenv("MUHGPT_API_KEY", "mghp_whatever")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    class _NoTTY:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _NoTTY())
+    main.ui.set_enabled(False)
+    try:
+        rc = main.main(["--reset-key", "--objective", "x", "--no-color"])
+    finally:
+        main.ui.set_enabled(None)
+    assert rc == 2
+    assert "reset-key" in capsys.readouterr().err
+
+
 def test_missing_key_non_interactive_still_errors(monkeypatch, tmp_path, capsys):
     # Piped / cron (no TTY): keep the hard config error — never hang on input.
     monkeypatch.delenv("MUHGPT_API_KEY", raising=False)
@@ -419,7 +468,7 @@ def test_error_hint_maps_typed_api_errors():
         APIStatusError(402, "x", error_type="insufficient_quota"))
     assert "/models" in main._error_hint(APIStatusError(404, "x", error_type="model_not_found"))
     assert "/models" in main._error_hint(APIStatusError(403, "x"))       # by status code
-    assert "API key" in main._error_hint(APIStatusError(401, "x"))
+    assert "--reset-key" in main._error_hint(APIStatusError(401, "x"))
     assert main._error_hint(APIStatusError(500, "x")) == ""              # unknown -> no hint
 
 

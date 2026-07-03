@@ -7,4 +7,4 @@ import warnings
 # startup clean without needing import-order gymnastics in main.py.
 warnings.filterwarnings("ignore", message=r"urllib3 v2 only supports OpenSSL")
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"

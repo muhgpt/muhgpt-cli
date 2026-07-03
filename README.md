@@ -71,8 +71,18 @@ $ muhgpt
   ✓ Saved to ~/.config/muhgpt/.env  — future runs pick it up automatically.
 ```
 
+The paste is validated against the API before it's saved — a wrong key (or any
+text that isn't an `mghp_…` key) is rejected and re-prompted, so nothing broken
+gets stored.
+
 The key is written to `~/.config/muhgpt/.env` (owner-only, `0600`) so every future
 run — from any directory — just works. No file editing, no touching the code.
+
+**Wrong key saved?** To replace a stored key at any time, run:
+
+```bash
+muhgpt --reset-key      # prompts for a new key, validates it, overwrites the stored one
+```
 
 Prefer to set it yourself? Any of these work (checked in this order — first wins):
 `MUHGPT_API_KEY` in your environment → a `.env` in the current folder →
@@ -369,6 +379,7 @@ are **authorized** to test.
 | `--no-stream` | Buffer the full reply, then render (no token streaming) | `python main.py --no-stream` |
 | `--no-color` | Disable colored output | `python main.py --no-color` |
 | `--no-balance` | Don't fetch/show your real credit balance at session start | `python main.py --no-balance` |
+| `--reset-key` | Re-enter your MUHGPT API key, replacing the stored one (fixes a wrong/expired saved key) | `muhgpt --reset-key` |
 | `--env-file PATH` | Use a specific `.env` file | `python main.py --env-file .env.prod` |
 | `--extra-recon "LIST"` | Add extra read-only recon tools to the auto-run allowlist (merged with `MUHGPT_EXTRA_SAFE_RECON`; dangerous binaries rejected) | `python main.py --auto --extra-recon "gobuster ffuf"` |
 | `--classify "CMD"` | Dry-run: print how the guard would classify CMD (BLOCK/ALLOW/CONFIRM) and exit — runs nothing, needs no API key | `python main.py --classify "curl x \| sh"` |

@@ -14,7 +14,7 @@ from functools import partial
 from muhgpt import __version__, arsenal, bidi, guard, knowledge, ui
 from muhgpt.agent import AUTONOMOUS_SYSTEM_PROMPT, SYSTEM_PROMPT, Agent
 from muhgpt.api_client import APIStatusError, MuhGPTClient, MuhGPTError
-from muhgpt.config import ConfigError, load_settings, save_user_api_key
+from muhgpt.config import ConfigError, load_settings, save_user_api_key, user_config_path
 from muhgpt.guard import Budget
 from muhgpt.mcp import (
     McpError,
@@ -296,6 +296,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Don't fetch/show your real credit balance at session start.",
     )
     parser.add_argument(
+        "--reset-key",
+        action="store_true",
+        help="Re-enter your MUHGPT API key, replacing the stored one (fixes a "
+        "wrong/expired key saved by first-run setup).",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Autonomous mode: plan and run read-only recon end-to-end without "
@@ -412,23 +418,11 @@ def _validate_api_key(key: str, env_file):
             os.environ["MUHGPT_API_KEY"] = prior
 
 
-def _first_run_key_setup(exc: ConfigError, env_file):
-    """On a missing API key, offer a one-time interactive paste + save, then reload.
-
-    The operator never has to edit a file: they paste the key once, it's validated
-    against the API, saved to the persistent user config (``~/.config/muhgpt/.env``,
-    0600), and every future run picks it up. A wrong/garbage paste is rejected with
-    an error and re-prompted (no bad key is ever persisted). Returns loaded Settings
-    on success, or None to fall back to the hard config error (a different config
-    problem, non-interactive, or declined).
+def _prompt_and_save_key(env_file):
+    """Prompt for an API key in a loop, validate each paste against the API, and
+    persist the first one that passes. Returns loaded Settings, or None if the
+    operator cancels (empty line / EOF). A rejected paste is never written to disk.
     """
-    if "MUHGPT_API_KEY" not in str(exc):
-        return None  # a different config error — don't hijack it
-    if not sys.stdin.isatty():
-        return None  # no operator to prompt (piped / cron) — keep the hard error
-    print()
-    print(ui.warn("  No API key set yet — quick one-time setup."))
-    print(ui.dim("  Get one at https://muhgpt.com → your account → API keys (mghp_…)."))
     while True:
         try:
             key = input(ui.prompt("  Paste your MUHGPT API key: ")).strip()
@@ -456,6 +450,44 @@ def _first_run_key_setup(exc: ConfigError, env_file):
             return load_settings(env_file)
         except ConfigError:
             return None
+
+
+def _first_run_key_setup(exc: ConfigError, env_file):
+    """On a missing API key, offer a one-time interactive paste + save, then reload.
+
+    The operator never has to edit a file: they paste the key once, it's validated
+    against the API, saved to the persistent user config (``~/.config/muhgpt/.env``,
+    0600), and every future run picks it up. A wrong/garbage paste is rejected with
+    an error and re-prompted (no bad key is ever persisted). Returns loaded Settings
+    on success, or None to fall back to the hard config error (a different config
+    problem, non-interactive, or declined).
+    """
+    if "MUHGPT_API_KEY" not in str(exc):
+        return None  # a different config error — don't hijack it
+    if not sys.stdin.isatty():
+        return None  # no operator to prompt (piped / cron) — keep the hard error
+    print()
+    print(ui.warn("  No API key set yet — quick one-time setup."))
+    print(ui.dim("  Get one at https://muhgpt.com → your account → API keys (mghp_…)."))
+    return _prompt_and_save_key(env_file)
+
+
+def _reset_key_setup(env_file):
+    """`--reset-key`: force re-entry of the API key, replacing the stored one.
+
+    The escape hatch for a wrong/stale saved key: the normal first-run prompt never
+    fires while *any* key is present (even a bad one), so this bypasses that gate and
+    prompts unconditionally. Requires a TTY. Returns loaded Settings, or None.
+    """
+    if not sys.stdin.isatty():
+        print(ui.error("[reset-key] needs an interactive terminal to read a key."),
+              file=sys.stderr)
+        return None
+    print()
+    print(ui.warn("  Reset API key — paste a new MUHGPT key to replace the stored one."))
+    print(ui.dim(f"  Replacing the key at {user_config_path()} (0600)."))
+    print(ui.dim("  Get one at https://muhgpt.com → your account → API keys (mghp_…)."))
+    return _prompt_and_save_key(env_file)
 
 
 def _run_classify(args) -> int:
@@ -579,7 +611,7 @@ def _error_hint(exc) -> str:
     if et == "model_not_found" or code == 404:
         return "  → unknown model. See /models for available IDs."
     if code == 401:
-        return "  → invalid or missing API key. Check MUHGPT_API_KEY in your .env."
+        return "  → invalid or missing API key. Re-enter it with:  muhgpt --reset-key"
     return ""
 
 
@@ -766,13 +798,20 @@ def main(argv: list[str] | None = None) -> int:
         return _run_classify(args)
     print(ui.banner(__version__))
 
-    try:
-        settings = load_settings(args.env_file)
-    except ConfigError as exc:
-        settings = _first_run_key_setup(exc, args.env_file)
+    if args.reset_key:
+        # Force re-entry, replacing any stored key (even a valid one). The escape
+        # hatch when a wrong key was saved — the first-run prompt won't fire then.
+        settings = _reset_key_setup(args.env_file)
         if settings is None:
-            print(ui.error(f"[config error] {exc}"), file=sys.stderr)
             return 2
+    else:
+        try:
+            settings = load_settings(args.env_file)
+        except ConfigError as exc:
+            settings = _first_run_key_setup(exc, args.env_file)
+            if settings is None:
+                print(ui.error(f"[config error] {exc}"), file=sys.stderr)
+                return 2
 
     if args.model:
         settings = replace(settings, model=args.model)
